@@ -1,0 +1,200 @@
+# ============================================
+# MedScribe Training Configuration
+# Hardware: RTX 5070 Ti (16GB VRAM), Windows
+# PyTorch: Nightly (CUDA 12.8)
+# ============================================
+
+experiment:
+  name: "medscribe-voice-to-soap"
+  description: "LoRA fine-tuning MedGemma 4B for clinical SOAP note generation"
+  seed: 42
+  tags: ["medgemma", "lora", "clinical-notes", "soap"]
+
+# Model Configuration
+model:
+  base_model: "google/medgemma-4b-it"
+  local_path: "./models/medgemma"
+  
+  # 4-bit Quantization (Windows-compatible via Transformers)
+  quantization:
+    load_in_4bit: true
+    bnb_4bit_quant_type: "nf4"
+    bnb_4bit_compute_dtype: "bfloat16"
+    bnb_4bit_use_double_quant: true
+  
+  device_map: "auto"
+  torch_dtype: "bfloat16"
+  max_memory: {0: "14GB"}  # Reserve 2GB for system
+  trust_remote_code: true
+
+# LoRA Configuration
+lora:
+  r: 16                    # Rank (balance capacity/efficiency)
+  lora_alpha: 16           # Scaling factor (alpha/r = 1.0)
+  lora_dropout: 0.05       # Regularization
+  bias: "none"
+  task_type: "CAUSAL_LM"
+  
+  # Target modules (all linear layers)
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  
+  # Full fine-tune these layers
+  modules_to_save:
+    - "lm_head"
+    - "embed_tokens"
+
+# Training Hyperparameters
+training:
+  # Batch configuration (RTX 5070 Ti can handle larger batches)
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4   # Effective batch = 32
+  gradient_checkpointing: true     # Save VRAM
+  
+  # Optimizer
+  optim: "adamw_torch"              # Standard AdamW (no 8-bit on Windows)
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-8
+  
+  # Learning rate schedule
+  num_train_epochs: 3
+  max_steps: -1                     # Use epochs instead
+  warmup_ratio: 0.1                 # 10% warmup
+  warmup_steps: 0                   # Calculated from warmup_ratio
+  lr_scheduler_type: "cosine"
+  
+  # Precision (BFloat16 on RTX 5070 Ti)
+  bf16: true
+  fp16: false
+  tf32: true                        # TensorFloat32 for extra speed
+  
+  # Logging & Checkpointing
+  logging_steps: 50
+  logging_strategy: "steps"
+  logging_first_step: true
+  
+  save_strategy: "steps"
+  save_steps: 250
+  save_total_limit: 3               # Keep only 3 best checkpoints
+  
+  # Evaluation
+  evaluation_strategy: "steps"
+  eval_steps: 250
+  eval_delay: 0
+  eval_accumulation_steps: 1
+  
+  # Model selection
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  
+  # Output
+  output_dir: "./models/checkpoints"
+  overwrite_output_dir: true
+  resume_from_checkpoint: null
+  
+  # Performance
+  dataloader_num_workers: 4         # Parallel data loading
+  dataloader_pin_memory: true
+  dataloader_prefetch_factor: 2
+  auto_find_batch_size: false       # Manual batch size
+  
+  # Stability
+  max_grad_norm: 1.0
+  seed: 42
+  data_seed: 42
+
+# Data Configuration
+data:
+  train_file: "./data/processed/train.jsonl"
+  validation_file: "./data/processed/val.jsonl"
+  test_file: "./data/processed/test.jsonl"
+  
+  max_seq_length: 2048              # Max tokens per sample
+  preprocessing_num_workers: 4
+  
+  # Data format
+  input_template: |
+    You are a clinical documentation assistant. Convert the following medical transcript into a structured SOAP note.
+    
+    TRANSCRIPT:
+    {transcript}
+    
+    Generate a SOAP note with these sections:
+    - SUBJECTIVE: Patient-reported symptoms and history
+    - OBJECTIVE: Physical exam findings and vital signs
+    - ASSESSMENT: Clinical impressions and diagnoses
+    - PLAN: Diagnostic tests, treatments, and follow-up
+    
+    SOAP NOTE:
+  
+  # Conversational format
+  conversation_template:
+    user_role: "user"
+    assistant_role: "assistant"
+    system_role: "system"
+
+# Logging Configuration
+logging:
+  report_to: "tensorboard"          # TensorBoard logging
+  logging_dir: "./logs/tensorboard"
+  logging_strategy: "steps"
+  logging_steps: 50
+  logging_first_step: true
+  
+  # Optional: Weights & Biases
+  # report_to: ["tensorboard", "wandb"]
+  # wandb_project: "medscribe"
+  # wandb_entity: "your_username"
+
+# Evaluation Metrics
+evaluation:
+  metrics:
+    - "loss"
+    - "perplexity"
+  
+  # Custom metrics (computed after training)
+  custom_metrics:
+    - "rouge"
+    - "bleu"
+    - "structure_completeness"
+
+# Early Stopping (Optional)
+early_stopping:
+  enabled: false
+  patience: 3
+  threshold: 0.0
+
+# Reproducibility
+reproducibility:
+  seed: 42
+  deterministic: false              # True = slower but reproducible
+  benchmark: true                   # cudnn.benchmark for speed
+
+# Advanced Settings
+advanced:
+  gradient_checkpointing_kwargs:
+    use_reentrant: false            # Better memory efficiency
+  
+  # Mixed precision training
+  fp16_opt_level: "O1"
+  
+  # Distributed training (single GPU, so disabled)
+  local_rank: -1
+  ddp_find_unused_parameters: false
+  
+  # Memory optimization
+  optim_target_modules: null
+  fsdp: ""
+  fsdp_config: null

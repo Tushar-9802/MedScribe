@@ -131,7 +131,6 @@ data/audio_samples
 # Processed data
 data/processed/*
 !data/processed/.gitkeep
-results/
 
 # Temporary data
 data/temp/
