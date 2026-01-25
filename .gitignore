@@ -109,7 +109,7 @@ models/checkpoints/*
 models/base/*
 !models/checkpoints/.gitkeep
 !models/base/.gitkeep
-
+models/medgemma
 # Cache files
 models/cache/
 *.cache
@@ -126,10 +126,12 @@ huggingface/
 data/raw/*
 !data/raw/.gitkeep
 !data/raw/README.md
+data/audio_samples
 
 # Processed data
 data/processed/*
 !data/processed/.gitkeep
+results/
 
 # Temporary data
 data/temp/

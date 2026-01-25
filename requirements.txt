@@ -20,7 +20,9 @@ safetensors>=0.4.0
 # Note: bitsandbytes NOT INCLUDED (Windows incompatible)
 # Alternative: Use built-in transformers 4-bit via accelerate
 
-# Audio Processing (MedASR)
+# Audio Generation and Processing (MedASR)
+gTTs 
+pydub
 librosa>=0.10.1
 soundfile>=0.12.1
 audioread>=3.0.1
