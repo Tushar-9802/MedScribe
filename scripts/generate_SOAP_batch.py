@@ -221,14 +221,13 @@ for idx in range(start_idx, len(df)):
         batch_df = pd.DataFrame(results)
         batch_file = os.path.join(OUTPUT_DIR, f"batch_{batch_id:03d}.csv")
         batch_df.to_csv(batch_file, index=False)
-        
         # Update progress
-        progress['last_completed_index'] = idx
-        if batch_id not in progress['completed_batches']:
-            progress['completed_batches'].append(batch_id)
+        progress['last_completed_index'] = int(idx)
+        if int(batch_id) not in progress['completed_batches']:
+            progress['completed_batches'].append(int(batch_id))
         progress['last_checkpoint_time'] = datetime.now().isoformat()
-        progress['total_samples'] = len(df)
-        progress['percent_complete'] = ((idx + 1) / len(df)) * 100
+        progress['total_samples'] = int(len(df))
+        progress['percent_complete'] = float(((idx + 1) / len(df)) * 100)
         
         with open(progress_file, 'w') as f:
             json.dump(progress, f, indent=2)
@@ -289,5 +288,3 @@ if all_batches:
 print("\n" + "="*60)
 print("Batch generation complete")
 print("="*60)
-print("\nNext: Run scripts/combine_all_samples.py")
-print("(After all nights complete)")
