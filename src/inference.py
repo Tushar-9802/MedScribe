@@ -1,13 +1,7 @@
 """
 MedScribe Inference Module
 ==========================
-Loads MedGemma v2 adapter and generates SOAP notes from transcripts.
-Designed for import by pipeline.py and app.py.
-
-Usage:
-    from src.inference import SOAPGenerator
-    gen = SOAPGenerator()
-    result = gen.generate("45 yo M c/o chest pain...")
+Loads MedGemma v2 adapter and generates SOAP notes + freeform clinical text.
 """
 import os
 import re
@@ -93,6 +87,7 @@ class _StopOnRepetition(StoppingCriteria):
 # POST-PROCESSING
 # ============================================================
 def _clean_soap(text):
+    """Clean raw SOAP output: strip repetitions, prompt leakage, trailing fragments."""
     if not text:
         return ""
     if "SOAP NOTE:" in text:
@@ -120,6 +115,55 @@ def _clean_soap(text):
     return text.strip()
 
 
+def format_soap_html(soap_text):
+    """
+    Convert SOAP plain text to formatted HTML.
+    Replaces **SECTION:** markers with styled bold headers.
+    """
+    if not soap_text:
+        return ""
+
+    html = soap_text
+
+    # Convert **SECTION:** to styled HTML headers
+    section_map = {
+        "SUBJECTIVE": "#1a5276",
+        "OBJECTIVE": "#1a5276",
+        "ASSESSMENT": "#1a5276",
+        "PLAN": "#1a5276",
+    }
+    for section, color in section_map.items():
+        # Match **SECTION:** or SECTION:
+        pattern = rf'\*\*{section}:\*\*|{section}:'
+        replacement = (
+            f'<div style="font-weight:700; color:{color}; font-size:14px; '
+            f'margin-top:12px; margin-bottom:4px; '
+            f'border-bottom:1px solid #d5dbdb; padding-bottom:2px;">'
+            f'{section}</div>'
+        )
+        html = re.sub(pattern, replacement, html)
+
+    # Convert numbered list items to styled items
+    html = re.sub(
+        r'^(\d+)\.\s',
+        r'<span style="color:#1a5276; font-weight:600;">\1.</span> ',
+        html,
+        flags=re.MULTILINE,
+    )
+
+    # Wrap in container with monospace font and explicit colors
+    # (forces light background + dark text regardless of Gradio theme)
+    html = (
+        f'<div style="font-family: \'IBM Plex Mono\', Consolas, monospace; '
+        f'font-size:13px; line-height:1.7; padding:12px; '
+        f'color:#1a1a1a !important; '
+        f'background:#fafbfc !important; border:1px solid #d5dbdb; border-radius:4px; '
+        f'white-space:pre-wrap;">{html}</div>'
+    )
+
+    return html
+
+
 # ============================================================
 # PROMPT
 # ============================================================
@@ -142,7 +186,7 @@ SOAP NOTE:"""
 # GENERATOR CLASS
 # ============================================================
 class SOAPGenerator:
-    """Loads MedGemma v2 and generates SOAP notes."""
+    """Loads MedGemma v2 and generates SOAP notes + freeform clinical text."""
 
     def __init__(self, adapter_path="./models/checkpoints/medgemma_v2_soap/final_model"):
         self.adapter_path = adapter_path
@@ -150,13 +194,10 @@ class SOAPGenerator:
         self.tokenizer = None
         self._loaded = False
 
-    def load(self, progress_callback=None):
+    def load(self):
         """Load model + adapter. Call once at startup."""
         if self._loaded:
             return
-
-        if progress_callback:
-            progress_callback("Loading MedGemma base model...")
 
         peft_config = PeftConfig.from_pretrained(self.adapter_path)
         bnb_config = BitsAndBytesConfig(
@@ -179,31 +220,19 @@ class SOAPGenerator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        if progress_callback:
-            progress_callback("Loading fine-tuned adapter...")
-
         self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
         self.model.eval()
         self.model.config.use_cache = True
 
         # Warmup
-        if progress_callback:
-            progress_callback("Warming up inference...")
         dummy = self.tokenizer("warmup", return_tensors="pt").to(self.model.device)
         with torch.inference_mode():
             self.model.generate(**dummy, max_new_tokens=10, pad_token_id=self.tokenizer.pad_token_id)
 
         self._loaded = True
-        if progress_callback:
-            progress_callback("MedGemma ready.")
 
     def generate(self, transcript, max_new_tokens=400, min_new_tokens=150):
-        """
-        Generate SOAP note from transcript.
-
-        Returns:
-            dict with keys: soap_note, time_s, tokens, word_count
-        """
+        """Generate SOAP note from transcript (uses LoRA adapter)."""
         if not self._loaded:
             raise RuntimeError("Model not loaded. Call .load() first.")
 
@@ -241,6 +270,40 @@ class SOAPGenerator:
             "time_s": round(elapsed, 1),
             "tokens": len(gen_ids),
             "word_count": len(clean.split()),
+        }
+
+    def generate_freeform(self, prompt, max_new_tokens=250):
+        """
+        Generate freeform text using the model (with LoRA still active).
+        Used for clinical tools: ICD-10 coding, patient summary, completeness check.
+        The base MedGemma instruction-following ability is preserved through LoRA.
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded.")
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        prompt_len = inputs["input_ids"].shape[1]
+
+        start = time.time()
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                use_cache=True,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        elapsed = time.time() - start
+
+        gen_ids = outputs[0][prompt_len:]
+        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+        return {
+            "text": text,
+            "time_s": round(elapsed, 1),
         }
 
     @property

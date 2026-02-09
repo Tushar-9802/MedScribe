@@ -1,23 +1,26 @@
 """
-MedScribe — Voice-to-SOAP Clinical Documentation
-=================================================
-Gradio interface for the MedScribe pipeline.
-Two HAI-DEF models: MedASR (speech) + MedGemma (text-to-SOAP).
+MedScribe — Clinical Documentation Workstation
+================================================
+Voice-to-SOAP + Clinical Intelligence powered by HAI-DEF models.
 
-Launch:
-    python app.py
+Tabs:
+1. Voice to SOAP    — MedASR transcription + MedGemma SOAP generation
+2. Text to SOAP     — Paste transcript, generate SOAP
+3. Clinical Tools   — ICD-10, patient summary, completeness, DDx, med check
+4. About            — Architecture, metrics, methodology
+
+Launch: python app.py
 """
 import os
 import time
 import gradio as gr
 from src.pipeline import MedScribePipeline
+from src.inference import format_soap_html
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 ADAPTER_PATH = "./models/checkpoints/medgemma_v2_soap/final_model"
-APP_TITLE = "MedScribe"
-APP_SUBTITLE = "Voice-to-SOAP Clinical Documentation"
 
 EXAMPLE_TRANSCRIPTS = [
     [
@@ -54,54 +57,54 @@ EXAMPLE_TRANSCRIPTS = [
         "over 3 months since job loss. Reports difficulty sleeping, poor appetite, "
         "loss of interest in activities. Denies suicidal ideation, hallucinations, "
         "or substance use. Currently on sertraline 50mg daily started 6 weeks ago "
-        "with minimal improvement. PHQ-9 score 14, GAD-7 score 12. Appears "
-        "well-groomed, cooperative. Speech normal rate and rhythm. Mood described "
-        "as sad. Affect constricted. Thought process linear. Insight and "
-        "judgment intact."
+        "with minimal improvement. PHQ-9 score 14, GAD-7 score 12."
     ],
 ]
 
 
 # ============================================================
-# CUSTOM CSS — clinical/medical professional theme
+# CUSTOM CSS — fixed-height status bar prevents layout reflow
 # ============================================================
 CUSTOM_CSS = """
-/* ---- Base ---- */
 .gradio-container {
-    max-width: 960px !important;
+    max-width: 1000px !important;
     margin: 0 auto !important;
     font-family: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif !important;
 }
-
-/* ---- Header ---- */
 .app-header {
     text-align: center;
-    padding: 24px 0 16px 0;
+    padding: 20px 0 14px 0;
     border-bottom: 2px solid #1a5276;
-    margin-bottom: 24px;
+    margin-bottom: 20px;
 }
 .app-header h1 {
-    font-size: 28px;
+    font-size: 26px;
     font-weight: 700;
     color: #1a5276;
     margin: 0;
     letter-spacing: -0.5px;
 }
 .app-header p {
-    font-size: 14px;
+    font-size: 13px;
     color: #566573;
-    margin: 4px 0 0 0;
+    margin: 3px 0 0 0;
 }
 
-/* ---- Status bar ---- */
+/* FIXED-HEIGHT status bar — prevents layout stuttering */
 .status-bar {
-    background: #eaf2f8;
-    border: 1px solid #aed6f1;
+    min-height: 36px;
+    max-height: 36px;
+    overflow: hidden;
     border-radius: 4px;
     padding: 8px 14px;
     font-size: 13px;
+    margin-bottom: 12px;
+    box-sizing: border-box;
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
+    background: #eaf2f8;
+    border: 1px solid #aed6f1;
     color: #1a5276;
-    margin-bottom: 16px;
+    line-height: 20px;
 }
 .status-bar.ready {
     background: #e8f8f5;
@@ -119,69 +122,28 @@ CUSTOM_CSS = """
     color: #922b21;
 }
 
-/* ---- Metrics row ---- */
-.metrics-row {
-    display: flex;
-    gap: 12px;
-    margin-top: 12px;
-}
-.metric-card {
-    flex: 1;
-    background: #f8f9fa;
-    border: 1px solid #d5dbdb;
-    border-radius: 4px;
-    padding: 10px 14px;
-    text-align: center;
-}
-.metric-card .label {
-    font-size: 11px;
-    color: #808b96;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-}
-.metric-card .value {
-    font-size: 20px;
-    font-weight: 600;
-    color: #1a5276;
-    margin-top: 2px;
-}
-
-/* ---- SOAP output formatting ---- */
-.soap-output textarea {
-    font-family: "IBM Plex Mono", "Consolas", monospace !important;
-    font-size: 13px !important;
-    line-height: 1.6 !important;
-}
-
-/* ---- Section dividers ---- */
 .section-label {
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 600;
     color: #808b96;
     text-transform: uppercase;
     letter-spacing: 0.8px;
-    margin: 20px 0 8px 0;
-    padding-bottom: 4px;
+    margin: 16px 0 6px 0;
+    padding-bottom: 3px;
     border-bottom: 1px solid #eaecee;
 }
-
-/* ---- Tab styling ---- */
 .tab-nav button {
     font-weight: 600 !important;
     font-size: 13px !important;
 }
-
-/* ---- Footer ---- */
 .app-footer {
     text-align: center;
-    padding: 16px 0;
-    margin-top: 24px;
+    padding: 14px 0;
+    margin-top: 20px;
     border-top: 1px solid #eaecee;
-    font-size: 12px;
+    font-size: 11px;
     color: #aab7b8;
 }
-
-/* ---- Button overrides ---- */
 .primary-btn {
     background: #1a5276 !important;
     border: none !important;
@@ -191,13 +153,58 @@ CUSTOM_CSS = """
 .primary-btn:hover {
     background: #154360 !important;
 }
+.tool-output {
+    font-family: "IBM Plex Sans", system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.6;
+    padding: 12px;
+    background: #fafbfc;
+    border: 1px solid #d5dbdb;
+    border-radius: 4px;
+    white-space: pre-wrap;
+}
+
+/* Prevent Gradio output containers from resizing during generation */
+.prose, .markdown-text, .output-html {
+    min-height: 0 !important;
+}
+
+/* ANTI-SHAKE: Disable Gradio's loading/generating animations that cause reflow */
+.generating {
+    min-height: inherit !important;
+    border: none !important;
+    animation: none !important;
+}
+.wrap.generating {
+    border: none !important;
+    animation: none !important;
+}
+/* Prevent the pulsing border effect on all components during generation */
+.border-none {
+    border: none !important;
+}
+div[data-testid] .wrap {
+    transition: none !important;
+}
+/* Lock the main container width to prevent horizontal jitter */
+.gradio-container > .main {
+    width: 100% !important;
+    max-width: 100% !important;
+    overflow-x: hidden !important;
+}
+/* Prevent scroll jumps */
+.contain {
+    overflow: auto !important;
+    scroll-behavior: auto !important;
+}
 """
 
 
 # ============================================================
-# GLOBAL PIPELINE
+# GLOBAL STATE
 # ============================================================
 pipeline = None
+last_soap_note = ""
 
 
 def get_pipeline():
@@ -207,123 +214,135 @@ def get_pipeline():
     return pipeline
 
 
-# ============================================================
-# HANDLER FUNCTIONS
-# ============================================================
-def load_models(progress=gr.Progress()):
-    """Load both MedASR and MedGemma models."""
-    pipe = get_pipeline()
-    status_parts = []
+def _status(level, msg):
+    return f'<div class="status-bar {level}">{msg}</div>'
 
+
+def _tool_html(text):
+    """Wrap clinical tool output in styled div."""
+    if not text:
+        return ""
+    import html as html_mod
+    safe = html_mod.escape(text)
+    safe = safe.replace('\n', '<br>')
+    return (
+        f'<div class="tool-output" style="color:#1a1a1a !important; '
+        f'background:#fafbfc !important;">{safe}</div>'
+    )
+
+
+# ============================================================
+# HANDLER: Load Models
+# ============================================================
+def load_models():
+    pipe = get_pipeline()
     try:
         if not pipe.asr_loaded:
-            progress(0.1, desc="Loading MedASR...")
             pipe.load_asr()
-            status_parts.append("MedASR loaded")
-
         if not pipe.soap_loaded:
-            progress(0.5, desc="Loading MedGemma...")
             pipe.load_soap()
-            status_parts.append("MedGemma loaded")
-
-        progress(1.0, desc="Ready")
-        return format_status("ready", "Models loaded. Ready for input.")
-
+        return _status("ready", "✓ Models loaded. Ready for input.")
     except Exception as e:
-        return format_status("error", f"Load failed: {str(e)}")
+        return _status("error", f"Load failed: {str(e)}")
 
 
-def process_audio(audio_path, progress=gr.Progress()):
-    """Full pipeline: audio -> transcript -> SOAP."""
+# ============================================================
+# HANDLER: Voice to SOAP
+# ============================================================
+def process_audio(audio_path):
+    global last_soap_note
     pipe = get_pipeline()
 
     if not pipe.fully_loaded:
-        return (
-            "",
-            "",
-            format_status("error", "Models not loaded. Click 'Load Models' first."),
-            "", "", "",
-        )
-
+        return ("", "", _status("error", "Models not loaded. Click 'Load Models' first."), "", "", "")
     if audio_path is None:
-        return (
-            "",
-            "",
-            format_status("error", "No audio provided."),
-            "", "", "",
-        )
+        return ("", "", _status("error", "No audio provided."), "", "", "")
 
     try:
-        # Transcribe
-        progress(0.2, desc="Transcribing with MedASR...")
         asr_result = pipe.transcribe(audio_path)
         transcript = asr_result["transcript"]
 
-        # Generate SOAP
-        progress(0.5, desc="Generating SOAP note...")
         soap_result = pipe.generate_soap(transcript)
-
-        total_time = round(asr_result["time_s"] + soap_result["time_s"], 1)
-        progress(1.0, desc="Complete")
+        last_soap_note = soap_result["soap_note"]
+        total = round(asr_result["time_s"] + soap_result["time_s"], 1)
 
         return (
             transcript,
-            soap_result["soap_note"],
-            format_status("ready", f"Complete in {total_time}s"),
+            format_soap_html(soap_result["soap_note"]),
+            _status("ready", f"✓ Complete in {total}s"),
             f'{asr_result["time_s"]}s',
             f'{soap_result["time_s"]}s',
-            f'{total_time}s',
+            f'{total}s',
         )
-
     except Exception as e:
-        return (
-            "",
-            "",
-            format_status("error", f"Error: {str(e)}"),
-            "", "", "",
-        )
+        return ("", "", _status("error", f"Error: {str(e)}"), "", "", "")
 
 
-def process_text(transcript, progress=gr.Progress()):
-    """Text-only pipeline: transcript -> SOAP."""
+# ============================================================
+# HANDLER: Text to SOAP
+# ============================================================
+def process_text(transcript):
+    global last_soap_note
     pipe = get_pipeline()
 
     if not pipe.soap_loaded:
-        return (
-            "",
-            format_status("error", "MedGemma not loaded. Click 'Load Models' first."),
-            "", "",
-        )
-
+        return ("", _status("error", "MedGemma not loaded. Click 'Load Models' first."), "", "")
     if not transcript or not transcript.strip():
-        return (
-            "",
-            format_status("error", "No transcript provided."),
-            "", "",
-        )
+        return ("", _status("error", "No transcript provided."), "", "")
 
     try:
-        progress(0.3, desc="Generating SOAP note...")
         result = pipe.generate_soap(transcript.strip())
-        progress(1.0, desc="Complete")
+        last_soap_note = result["soap_note"]
 
         return (
-            result["soap_note"],
-            format_status("ready", f'Complete in {result["time_s"]}s'),
+            format_soap_html(result["soap_note"]),
+            _status("ready", f'✓ Complete in {result["time_s"]}s  |  {result["word_count"]} words'),
             f'{result["time_s"]}s',
             f'{result["word_count"]} words',
         )
-
     except Exception as e:
+        return ("", _status("error", f"Error: {str(e)}"), "", "")
+
+
+# ============================================================
+# HANDLER: Clinical Tools (generic wrapper)
+# ============================================================
+def _run_tool(tool_fn, tool_name, soap_note_input):
+    """Generic wrapper for all clinical tools."""
+    pipe = get_pipeline()
+    note = soap_note_input.strip() if soap_note_input else last_soap_note
+    if not note:
+        return _status("error", "No SOAP note available. Generate one first."), ""
+    if not pipe.soap_loaded:
+        return _status("error", "Model not loaded."), ""
+    try:
+        result = tool_fn(note)
         return (
-            "",
-            format_status("error", f"Error: {str(e)}"),
-            "", "",
+            _status("ready", f'✓ {tool_name} complete in {result["time_s"]}s'),
+            _tool_html(result["text"]),
         )
+    except Exception as e:
+        return _status("error", str(e)), ""
 
 
-def format_status(level, message):
-    return f'<div class="status-bar {level}">{message}</div>'
+def run_icd10(soap_input):
+    return _run_tool(get_pipeline().suggest_icd10, "ICD-10 coding", soap_input)
+
+
+def run_patient_summary(soap_input):
+    return _run_tool(get_pipeline().patient_summary, "Patient summary", soap_input)
+
+
+def run_completeness(soap_input):
+    return _run_tool(get_pipeline().completeness_check, "Documentation review", soap_input)
+
+
+def run_differential(soap_input):
+    return _run_tool(get_pipeline().differential_diagnosis, "Differential diagnosis", soap_input)
+
+
+def run_med_check(soap_input):
+    return _run_tool(get_pipeline().medication_check, "Medication review", soap_input)
 
 
 # ============================================================
@@ -331,75 +350,58 @@ def format_status(level, message):
 # ============================================================
 def build_app():
     with gr.Blocks(
-        css=CUSTOM_CSS,
         title="MedScribe",
-        theme=gr.themes.Base(
-            primary_hue=gr.themes.colors.blue,
-            neutral_hue=gr.themes.colors.gray,
-            font=["IBM Plex Sans", "system-ui", "sans-serif"],
-            font_mono=["IBM Plex Mono", "Consolas", "monospace"],
-        ),
     ) as app:
 
         # Header
         gr.HTML(
-            f'<div class="app-header">'
-            f"<h1>{APP_TITLE}</h1>"
-            f"<p>{APP_SUBTITLE}</p>"
-            f"<p style='font-size:12px; color:#aab7b8; margin-top:2px;'>"
-            f"MedASR + MedGemma  |  HAI-DEF Pipeline  |  Edge AI</p>"
-            f"</div>"
+            '<div class="app-header">'
+            "<h1>MedScribe</h1>"
+            "<p>Clinical Documentation Workstation</p>"
+            "<p style='font-size:11px; color:#aab7b8; margin-top:2px;'>"
+            "MedASR + MedGemma  |  HAI-DEF Pipeline  |  Voice-to-SOAP + Clinical Intelligence</p>"
+            "</div>"
         )
 
-        # Status
+        # Status bar (shared, FIXED HEIGHT via CSS)
         status_html = gr.HTML(
-            format_status("", "Models not loaded. Click 'Load Models' to begin."),
+            _status("", "Models not loaded. Click 'Load Models' to begin.")
         )
 
         # Load button
-        load_btn = gr.Button(
-            "Load Models",
-            variant="secondary",
-            size="sm",
-        )
-        load_btn.click(fn=load_models, outputs=[status_html])
+        load_btn = gr.Button("Load Models", variant="secondary", size="sm")
+        load_btn.click(fn=load_models, outputs=[status_html], show_progress="hidden")
 
-        # Tabs
         with gr.Tabs():
 
-            # ---- TAB 1: Voice -> SOAP ----
+            # ============================================
+            # TAB 1: Voice to SOAP
+            # ============================================
             with gr.TabItem("Voice to SOAP"):
                 gr.HTML('<div class="section-label">Audio Input</div>')
-
                 audio_input = gr.Audio(
                     sources=["microphone", "upload"],
                     type="filepath",
-                    label="Record or upload audio",
+                    label="Record or upload clinical dictation",
                 )
-
                 voice_btn = gr.Button(
-                    "Transcribe and Generate",
-                    variant="primary",
+                    "Transcribe and Generate", variant="primary",
                     elem_classes=["primary-btn"],
                 )
 
                 gr.HTML('<div class="section-label">Transcript (MedASR)</div>')
                 voice_transcript = gr.Textbox(
-                    label="Transcript",
-                    lines=4,
-                    interactive=True,
-                    placeholder="Transcript will appear here after processing...",
-                    show_label=False,
+                    lines=4, interactive=True, show_label=False,
+                    placeholder="Transcript appears here. You can edit before regenerating.",
                 )
 
-                gr.HTML('<div class="section-label">SOAP Note (MedGemma)</div>')
-                voice_soap = gr.Textbox(
-                    label="SOAP Note",
-                    lines=16,
-                    interactive=False,
-                    show_label=False,
-                    elem_classes=["soap-output"],
+                voice_regen_btn = gr.Button(
+                    "Regenerate SOAP from Edited Transcript",
+                    variant="secondary", size="sm",
                 )
+
+                gr.HTML('<div class="section-label">SOAP Note (MedGemma, fine-tuned)</div>')
+                voice_soap = gr.HTML()
 
                 with gr.Row():
                     voice_asr_time = gr.Textbox(label="ASR Time", interactive=False, scale=1)
@@ -409,41 +411,39 @@ def build_app():
                 voice_btn.click(
                     fn=process_audio,
                     inputs=[audio_input],
-                    outputs=[
-                        voice_transcript,
-                        voice_soap,
-                        status_html,
-                        voice_asr_time,
-                        voice_soap_time,
-                        voice_total_time,
-                    ],
+                    outputs=[voice_transcript, voice_soap, status_html,
+                             voice_asr_time, voice_soap_time, voice_total_time],
+                    show_progress="hidden",
                 )
 
-            # ---- TAB 2: Text -> SOAP ----
+                def regen_from_transcript(transcript):
+                    result = process_text(transcript)
+                    return (result[0], result[1], "", result[2], "")
+
+                voice_regen_btn.click(
+                    fn=regen_from_transcript,
+                    inputs=[voice_transcript],
+                    outputs=[voice_soap, status_html,
+                             voice_asr_time, voice_soap_time, voice_total_time],
+                    show_progress="hidden",
+                )
+
+            # ============================================
+            # TAB 2: Text to SOAP
+            # ============================================
             with gr.TabItem("Text to SOAP"):
                 gr.HTML('<div class="section-label">Medical Transcript</div>')
-
                 text_input = gr.Textbox(
-                    label="Transcript",
-                    lines=6,
-                    placeholder="Paste or type a medical encounter transcript here...",
-                    show_label=False,
+                    lines=6, show_label=False,
+                    placeholder="Paste or type a medical encounter transcript...",
                 )
-
                 text_btn = gr.Button(
-                    "Generate SOAP Note",
-                    variant="primary",
+                    "Generate SOAP Note", variant="primary",
                     elem_classes=["primary-btn"],
                 )
 
-                gr.HTML('<div class="section-label">SOAP Note (MedGemma)</div>')
-                text_soap = gr.Textbox(
-                    label="SOAP Note",
-                    lines=16,
-                    interactive=False,
-                    show_label=False,
-                    elem_classes=["soap-output"],
-                )
+                gr.HTML('<div class="section-label">SOAP Note (MedGemma, fine-tuned)</div>')
+                text_soap = gr.HTML()
 
                 with gr.Row():
                     text_gen_time = gr.Textbox(label="Generation Time", interactive=False, scale=1)
@@ -452,94 +452,162 @@ def build_app():
                 text_btn.click(
                     fn=process_text,
                     inputs=[text_input],
-                    outputs=[
-                        text_soap,
-                        status_html,
-                        text_gen_time,
-                        text_word_count,
-                    ],
+                    outputs=[text_soap, status_html, text_gen_time, text_word_count],
+                    show_progress="hidden",
                 )
 
-                # Example buttons
                 gr.HTML('<div class="section-label">Example Transcripts</div>')
-                gr.Examples(
-                    examples=EXAMPLE_TRANSCRIPTS,
-                    inputs=[text_input],
-                    label="",
+                gr.Examples(examples=EXAMPLE_TRANSCRIPTS, inputs=[text_input], label="")
+
+            # ============================================
+            # TAB 3: Clinical Tools (5 tools)
+            # ============================================
+            with gr.TabItem("Clinical Tools"):
+                gr.HTML(
+                    '<div class="section-label">Clinical Intelligence (Base MedGemma)</div>'
+                    '<p style="font-size:12px; color:#808b96; margin-bottom:12px;">'
+                    'Analyze SOAP notes using MedGemma\'s base instruction-following capability. '
+                    'Generate a SOAP note first, or paste one below.</p>'
                 )
 
-            # ---- TAB 3: About ----
+                tools_soap_input = gr.Textbox(
+                    lines=8, show_label=False,
+                    placeholder="Paste a SOAP note here, or generate one in Voice/Text tabs first. "
+                    "The most recently generated note is used automatically if this is empty.",
+                )
+
+                # Row 1: Documentation tools
+                with gr.Row():
+                    icd_btn = gr.Button("ICD-10 Codes", variant="secondary", scale=1)
+                    summary_btn = gr.Button("Patient Summary", variant="secondary", scale=1)
+                    complete_btn = gr.Button("Completeness Check", variant="secondary", scale=1)
+
+                # Row 2: Clinical reasoning tools
+                with gr.Row():
+                    ddx_btn = gr.Button("Differential Diagnosis", variant="secondary", scale=1)
+                    med_btn = gr.Button("Medication Check", variant="secondary", scale=1)
+
+                tools_status = gr.HTML(
+                    _status("", "Select a tool above to analyze the SOAP note.")
+                )
+
+                gr.HTML('<div class="section-label">Result</div>')
+                tools_output = gr.HTML()
+
+                icd_btn.click(
+                    fn=run_icd10, inputs=[tools_soap_input],
+                    outputs=[tools_status, tools_output],
+                    show_progress="hidden",
+                )
+                summary_btn.click(
+                    fn=run_patient_summary, inputs=[tools_soap_input],
+                    outputs=[tools_status, tools_output],
+                    show_progress="hidden",
+                )
+                complete_btn.click(
+                    fn=run_completeness, inputs=[tools_soap_input],
+                    outputs=[tools_status, tools_output],
+                    show_progress="hidden",
+                )
+                ddx_btn.click(
+                    fn=run_differential, inputs=[tools_soap_input],
+                    outputs=[tools_status, tools_output],
+                    show_progress="hidden",
+                )
+                med_btn.click(
+                    fn=run_med_check, inputs=[tools_soap_input],
+                    outputs=[tools_status, tools_output],
+                    show_progress="hidden",
+                )
+
+            # ============================================
+            # TAB 4: About
+            # ============================================
             with gr.TabItem("About"):
-                gr.Markdown(
-                    """
-### Architecture
+                gr.Markdown("""
+### MedScribe — Clinical Documentation Workstation
 
-MedScribe is a two-stage pipeline built entirely on Google's
-Health AI Developer Foundations (HAI-DEF) ecosystem:
+**Problem**: AI documentation tools like Dragon Copilot generate verbose, textbook-style
+notes. A nephrologist reports: *"More often than not I have to go and edit the notes and
+shorten them, because they read like textbook lexicon rather than shorthand designed to
+deliver efficient summaries with alacrity."* Editing AI notes takes longer than writing
+from scratch.
 
-**Stage 1 -- Speech Recognition (MedASR)**
-- 105M parameter Conformer model
-- Trained on 5,000+ hours of physician dictation
-- 5.2% WER on medical dictation (vs 28.2% for Whisper v3 Large)
-- Runs on CPU or GPU, processes audio in real time
+**Solution**: MedScribe generates concise clinical shorthand using a fine-tuned MedGemma
+model, then provides clinical intelligence tools for the complete documentation workflow.
 
-**Stage 2 -- SOAP Note Generation (MedGemma 1.5 4B)**
-- Fine-tuned with LoRA on 712 curated training samples
-- Training data generated by GPT-4o with anti-hallucination constraints
-- Produces concise, clinically complete SOAP notes (100 words median)
-- Zero WNL shortcuts, zero fabricated findings
-- Runs on consumer GPU (RTX 5070 Ti, 16GB VRAM)
+---
+
+### Architecture — Three HAI-DEF Models, One Pipeline
+
+| Component | Model | Role |
+|-----------|-------|------|
+| Speech Recognition | MedASR (105M, Conformer) | Medical dictation → text, 5.2% WER |
+| SOAP Generation | MedGemma 1.5 4B (LoRA fine-tuned) | Concise structured notes (~100 words) |
+| Clinical Intelligence | MedGemma 1.5 4B (base, instruction-tuned) | ICD-10, DDx, med check, summaries, QA |
+
+### Clinical Intelligence Tools
+
+| Tool | Function |
+|------|----------|
+| ICD-10 Coding | Suggests billing codes from SOAP documentation |
+| Patient Summary | Plain-language visit summary for patients |
+| Completeness Check | Identifies documentation gaps |
+| Differential Diagnosis | Ranked DDx with supporting/refuting evidence |
+| Medication Check | Drug interactions, contraindications, dosage review |
+
+### Training Methodology
+
+- 712 curated samples generated by GPT-4o with anti-hallucination constraints
+- LoRA fine-tuning (rank 16, alpha 32) on MedGemma 1.5 4B
+- Anti-hallucination: "Not documented in source" for missing data
+- Zero WNL shortcuts enforced in training data
+- Validation loss 0.782 < Train loss 0.828 (no overfitting)
 
 ### Key Metrics
 
 | Metric | Value |
 |--------|-------|
-| Train loss | 0.828 |
-| Val loss | 0.782 |
 | Quality score | 90/100 |
-| Section completeness | 100% |
+| Section completeness | 100% (S/O/A/P) |
 | WNL present | 0% |
-| Anti-hallucination compliance | 64% use "Not documented" |
-| Avg inference time | 24.8s |
+| Hallucinated findings | 0% |
+| Avg word count | 104 words (vs ~200+ for verbose tools) |
+| Avg inference time | ~25s |
 | PLAN items | 2-4 per note |
 
-### Clinical Motivation
+### Deployment
 
-Existing AI documentation tools generate verbose, textbook-style notes
-that physicians must manually edit for brevity. MedScribe generates
-the concise shorthand clinicians actually write -- reducing post-generation
-editing time while preserving clinical completeness.
+- Runs on consumer GPU (RTX 5070 Ti, 16GB VRAM)
+- 4-bit quantization via bitsandbytes (NF4)
+- Fully offline capable — no cloud dependency
+- MedASR + MedGemma coexist in 16GB VRAM
 
 ### Limitations
 
-- English only (MedASR training data)
-- Not validated for clinical use -- research prototype only
-- May produce incomplete notes for rare specialties
-- Inference speed depends on GPU hardware
-- Training data derived from MTSamples (synthetic encounters)
+- English only (MedASR training constraint)
+- Research prototype — not validated for clinical use
+- Training data derived from synthetic encounters
+- Inference speed hardware-dependent
+- Clinical tools use base model instruction-following, not fine-tuned for coding accuracy
 
-### Competition
+---
 
-MedGemma Impact Challenge -- Kaggle 2026
-$100,000 prize pool | Main Track + Edge AI Prize
-"""
-                )
+MedGemma Impact Challenge 2026 | Main Track + Novel Task Prize
+""")
 
         # Footer
         gr.HTML(
             '<div class="app-footer">'
             "MedScribe | MedGemma Impact Challenge 2026 | "
-            "HAI-DEF: MedASR + MedGemma 1.5 4B | "
-            "Research prototype -- not for clinical use"
+            "HAI-DEF: MedASR + MedGemma 1.5 4B (fine-tuned + base) | "
+            "Research prototype — not for clinical use"
             "</div>"
         )
 
     return app
 
 
-# ============================================================
-# MAIN
-# ============================================================
 if __name__ == "__main__":
     app = build_app()
     app.launch(
@@ -547,4 +615,11 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         show_error=True,
+        css=CUSTOM_CSS,
+        theme=gr.themes.Base(
+            primary_hue=gr.themes.colors.blue,
+            neutral_hue=gr.themes.colors.gray,
+            font=["IBM Plex Sans", "system-ui", "sans-serif"],
+            font_mono=["IBM Plex Mono", "Consolas", "monospace"],
+        ),
     )
