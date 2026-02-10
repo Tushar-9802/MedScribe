@@ -1,12 +1,11 @@
 # ============================================
-# MedScribe - PC Requirements (RTX 5070 Ti)
+# MedScribe - Runtime Requirements (RTX 5070 Ti)
 # PyTorch Nightly for Blackwell SM 12.0
 # ============================================
 
 --extra-index-url https://download.pytorch.org/whl/nightly/cu128
 --pre
 torch
-torchvision
 torchaudio
 
 # Core Transformers Stack
@@ -17,64 +16,25 @@ sentencepiece>=0.2.0
 protobuf>=5.29.0
 safetensors>=0.4.0
 
-# Note: bitsandbytes NOT INCLUDED (Windows incompatible)
-# Alternative: Use built-in transformers 4-bit via accelerate
+# Quantization
+# Note: On Windows, install via: pip install bitsandbytes-windows
+# Or use latest bitsandbytes which has native Windows support
+bitsandbytes>=0.43.0
 
-# Audio Generation and Processing (MedASR)
-gTTs 
-pydub
+# Audio Processing (MedASR)
 librosa>=0.10.1
 soundfile>=0.12.1
-audioread>=3.0.1
-resampy>=0.4.2
 
 # Data Processing
-datasets>=3.2.0
 pandas>=2.2.0
 numpy>=1.26.0,<2.0.0
-scikit-learn>=1.6.0
 scipy>=1.14.0
-pyarrow>=12.0.0
 
-# Evaluation Metrics
-evaluate>=0.4.1
-rouge-score>=0.1.2
-nltk>=3.8.1
-sacrebleu>=2.3.1
-jiwer>=3.0.3
-bert-score>=0.3.13
-
-# UI & API
-gradio>=4.8.0
-streamlit>=1.40.0
-fastapi>=0.104.1
-uvicorn[standard]>=0.24.0
-pydantic>=2.5.0
-python-multipart>=0.0.6
-aiofiles>=23.2.1
-
-# Deployment (Note: ONNX may have issues with nightly PyTorch)
-# onnx>=1.15.0
-# onnxruntime-gpu>=1.16.3
-# optimum[onnxruntime]>=1.16.1
+# UI
+gradio>=5.0.0
 
 # Utilities
-python-dotenv>=1.0.0
 tqdm>=4.67.0
 pyyaml>=6.0
-requests>=2.31.0
 huggingface-hub>=0.20.0
-
-# Training Monitoring
-tensorboard>=2.18.0
-wandb>=0.16.0
-matplotlib>=3.9.0
-openai>=1.61.0
-
-# Training (LoRA alternative without bitsandbytes)
-trl>=0.8.0
-
-# Development
-pytest>=8.3.0
-black>=24.10.0
-flake8>=7.1.0
+nltk>=3.8.1
