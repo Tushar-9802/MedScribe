@@ -84,6 +84,43 @@ class _StopOnRepetition(StoppingCriteria):
         return False
 
 
+class _FreeformStopCriteria(StoppingCriteria):
+    """Stop freeform generation on repetition, prompt leakage, or section re-emission."""
+    def __init__(self, tokenizer, prompt_length=0):
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+
+    def __call__(self, input_ids, scores, **kwargs):
+        gen_ids = input_ids[0][self.prompt_length:]
+        if gen_ids.shape[0] < 30:
+            return False
+        text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
+        upper = text.upper()
+
+        # Stop if SOAP sections leak into freeform output
+        if "SUBJECTIVE:" in upper and "OBJECTIVE:" in upper:
+            return True
+
+        # Stop on prompt/header leakage (marker appears after first 20 chars = repeat)
+        for p in ["SOAP NOTE:", "MEDICAL TEXT:", "PATIENT PROFILE:",
+                   "You are a clinical", "Convert the following", "\n---\n",
+                   "BILLABLE DIAGNOSES:", "ICD-10-CM CODES:",
+                   "PATIENT SUMMARY:", "DOCUMENTATION REVIEW:",
+                   "DIFFERENTIAL DIAGNOSIS:", "MEDICATION REVIEW:", "GAPS:"]:
+            first = text.find(p)
+            if first != -1 and first > 20:
+                return True
+
+        # Stop if any analysis section header appears twice
+        for header in ["RISK ASSESSMENT", "DIFFERENTIAL CONSIDERATIONS",
+                        "RECOMMENDED SCREENINGS", "RED FLAGS", "CLINICAL QUESTIONS"]:
+            first = upper.find(header)
+            if first != -1 and upper.find(header, first + len(header) + 5) != -1:
+                return True
+
+        return False
+
+
 # ============================================================
 # POST-PROCESSING
 # ============================================================
@@ -320,7 +357,7 @@ class SOAPGenerator:
     def generate_freeform(self, prompt, max_new_tokens=250):
         """
         Generate freeform text using the model (with LoRA still active).
-        Used for clinical tools: ICD-10 coding, patient summary, completeness check.
+        Used for clinical tools: Billable Diagnoses, patient summary, completeness check.
         The base MedGemma instruction-following ability is preserved through LoRA.
         """
         if not self._loaded:
@@ -328,6 +365,9 @@ class SOAPGenerator:
 
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
         prompt_len = inputs["input_ids"].shape[1]
+
+        stop = _FreeformStopCriteria(self.tokenizer, prompt_length=prompt_len)
+        criteria = StoppingCriteriaList([stop])
 
         start = time.time()
         with torch.inference_mode():
@@ -340,11 +380,50 @@ class SOAPGenerator:
                 use_cache=True,
                 pad_token_id=self.tokenizer.pad_token_id,
                 eos_token_id=self.tokenizer.eos_token_id,
+                stopping_criteria=criteria,
             )
         elapsed = time.time() - start
 
         gen_ids = outputs[0][prompt_len:]
         text = self.tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+
+        # Post-process: truncate at repeated section headers
+        for marker in ["SUBJECTIVE:", "SOAP NOTE:", "PATIENT SUMMARY:",
+                        "BILLABLE DIAGNOSES:", "ICD-10-CM CODES:",
+                        "DOCUMENTATION REVIEW:", "DIFFERENTIAL DIAGNOSIS:",
+                        "MEDICATION REVIEW:", "PATIENT PROFILE:", "GAPS:"]:
+            idx = text.find(marker)
+            if idx > 20:
+                text = text[:idx].strip()
+
+        # Truncate at repeated analysis section headers
+        upper = text.upper()
+        for header in ["RISK ASSESSMENT", "DIFFERENTIAL CONSIDERATIONS",
+                        "RECOMMENDED SCREENINGS", "RED FLAGS", "CLINICAL QUESTIONS"]:
+            first = upper.find(header)
+            if first != -1:
+                second = upper.find(header, first + len(header) + 5)
+                if second != -1:
+                    text = text[:second].strip()
+                    upper = text.upper()  # refresh after truncation
+
+        # Kill numbered list degeneration: if same line appears twice, cut
+        lines = text.split('\n')
+        seen = set()
+        clean_lines = []
+        for line in lines:
+            normalized = line.strip().lower()
+            if len(normalized) > 20 and normalized in seen:
+                break
+            if normalized:
+                seen.add(normalized)
+            clean_lines.append(line)
+        text = '\n'.join(clean_lines).strip()
+
+        # Strip trailing incomplete headers
+        for tail in ["**RANKED", "**NOTE", "**SUMMARY", "RANKED", "**"]:
+            if text.rstrip().endswith(tail):
+                text = text[:text.rfind(tail)].strip()
 
         return {
             "text": text,

@@ -6,15 +6,17 @@ Orchestrates MedASR (speech-to-text) + MedGemma (text-to-SOAP) + Clinical Tools.
 Three HAI-DEF model uses:
 - MedASR: 105M param Conformer, 5.2% WER on medical dictation
 - MedGemma (fine-tuned): LoRA adapter for concise SOAP notes
-- MedGemma (base): instruction-tuned for ICD-10, patient summary, completeness,
+- MedGemma (base): instruction-tuned for Billable Diagnoses, patient summary, completeness,
   differential diagnosis, and medication interaction checks
 """
 import os
 import re
 import time
+import json
 import torch
 import librosa
 import numpy as np
+from pathlib import Path
 
 try:
     from transformers import AutoModelForCTC, AutoProcessor
@@ -26,7 +28,7 @@ from src.inference import SOAPGenerator
 
 
 # ============================================================
-# CTC DECODING — Gemini's proven manual implementation
+# CTC DECODING
 # ============================================================
 def _manual_ctc_decode(token_ids, blank_id, id_to_token):
     """Collapses duplicates and filters blanks for CTC/RNN-T models."""
@@ -40,8 +42,7 @@ def _manual_ctc_decode(token_ids, blank_id, id_to_token):
 
 
 # ============================================================
-# TRANSCRIPT POST-PROCESSING — based on Gemini's process_for_medgemma
-# with stutter-killer and enhanced punctuation handling
+# TRANSCRIPT POST-PROCESSING
 # ============================================================
 def _clean_transcript(raw_text):
     """
@@ -54,18 +55,10 @@ def _clean_transcript(raw_text):
     if not raw_text:
         return ""
 
-    # 1. CTC STUTTER-KILLER — collapse 3+ identical characters
-    #    Preserves valid doubles (ll, ee, ss) but kills stutters (CCT→CT, TTT→T)
     text = re.sub(r'(.)\1{2,}', r'\1', raw_text)
-
-    # 2. SentencePiece word boundary → space
     text = text.replace("▁", " ")
-
-    # 3. Strip special tokens
     text = re.sub(r'</?s>|<epsilon>|<pad>|<unk>', '', text)
 
-    # 4. Map punctuation tokens to actual characters
-    #    Using \{+ and \}+ to catch stuttered variants like {{period}}
     punctuation_map = {
         r'\{+[\s]*period[\s]*\}+': '.',
         r'\{+[\s]*comma[\s]*\}+': ',',
@@ -78,29 +71,51 @@ def _clean_transcript(raw_text):
     for pattern, replacement in punctuation_map.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
 
-    # 5. Remove bracket markers [EXAM TYPE], [INDICATION], etc.
     text = re.sub(r'\[[^\]]*\]', '', text)
-
-    # 6. Remove remaining braces
     text = re.sub(r'[{}]', '', text)
-
-    # 7. Fix space-before-punctuation: "lobe ." → "lobe."
     text = re.sub(r'\s+([.,;:?!])', r'\1', text)
-    # Add space after punctuation if missing: "lobe.No" → "lobe. No"
     text = re.sub(r'([.,;:?!])([A-Za-z])', r'\1 \2', text)
-
-    # 8. Collapse whitespace
     text = re.sub(r'\n\s+', '\n', text)
     text = re.sub(r' {2,}', ' ', text)
     text = text.strip()
-
-    # 9. Remove leading/trailing punctuation artifacts
     text = text.strip(' .,;:')
 
-    # 10. Sentence capitalization
     if text:
         text = text[0].upper() + text[1:]
     text = re.sub(r'(?<=[.!?]\s)([a-z])', lambda m: m.group(1).upper(), text)
+
+    return text.strip()
+
+# ============================================================
+# CLINICAL OUTPUT POST-PROCESSING
+# ============================================================
+def _clean_tool_output(text):
+    """Strip model artifacts from clinical tool output."""
+    if not text:
+        return text
+
+    # Strip 'Final Answer' blocks
+    text = re.split(r'Final Answer:', text, maxsplit=1)[0]
+    text = re.split(r'The final answer is', text, maxsplit=1)[0]
+
+    # Strip second+ 'Rationale:' sections
+    parts = text.split('Rationale:')
+    if len(parts) > 2:
+        text = parts[0] + 'Rationale:' + parts[1]
+
+    # Strip LaTeX box artifacts
+    text = re.sub(r'\$\\boxed\{[^}]*\}\$', '', text)
+
+    # Strip lines with "not documented in source" / "not specified in source"
+    lines = text.split('\n')
+    lines = [l for l in lines if "not documented in source" not in l.lower()
+             and "not specified in source" not in l.lower()]
+    text = '\n'.join(lines).strip()
+
+    # Strip trailing incomplete headers
+    for tail in ["**RANKED", "**NOTE", "**SUMMARY", "RANKED", "**"]:
+        if text.rstrip().endswith(tail):
+            text = text[:text.rfind(tail)].strip()
 
     return text.strip()
 
@@ -116,7 +131,6 @@ class MedScribePipeline:
         self.asr_model = None
         self.asr_processor = None
         self._asr_loaded = False
-        # Cached vocab for CTC decode (built once at load time)
         self._inv_vocab = None
         self._blank_id = None
 
@@ -134,7 +148,6 @@ class MedScribePipeline:
         self.asr_model = AutoModelForCTC.from_pretrained(self.MEDASR_MODEL_ID).to(device)
         self.asr_model.eval()
 
-        # Pre-build inverse vocab for manual CTC decode (avoids rebuilding per call)
         vocab = self.asr_processor.tokenizer.get_vocab()
         self._inv_vocab = {v: k for k, v in vocab.items()}
         self._blank_id = self.asr_processor.tokenizer.pad_token_id
@@ -150,40 +163,32 @@ class MedScribePipeline:
         self.load_soap()
 
     # --------------------------------------------------------
-    # TRANSCRIPTION — Gemini's proven manual CTC decode
+    # TRANSCRIPTION
     # --------------------------------------------------------
     def transcribe(self, audio_path):
         if not self._asr_loaded:
             raise RuntimeError("MedASR not loaded.")
 
-        # Load and resample audio to 16kHz mono (explicit mono=True)
         speech, sr = librosa.load(audio_path, sr=self.SAMPLE_RATE, mono=True)
-        # Normalize audio amplitude — Gradio can send float32 at varying ranges
         speech = librosa.util.normalize(speech)
         audio_duration = len(speech) / self.SAMPLE_RATE
 
-        # Prepare inputs
         device = next(self.asr_model.parameters()).device
         inputs = self.asr_processor(
             speech, sampling_rate=self.SAMPLE_RATE,
             return_tensors="pt", padding=True,
         ).to(device)
 
-        # Inference → logits → argmax → manual CTC decode
-        # This is the exact flow that Gemini proved works correctly
         start = time.time()
         with torch.inference_mode():
             logits = self.asr_model(**inputs).logits
 
         predicted_ids = torch.argmax(logits, dim=-1)[0]
-
-        # Manual CTC decode using pre-built vocab
         raw = _manual_ctc_decode(
             predicted_ids.tolist(), self._blank_id, self._inv_vocab
         )
         elapsed = time.time() - start
 
-        # Post-process: stutter-killer + punctuation tokens + formatting
         clean = _clean_transcript(raw)
 
         print(f"[MedASR] Transcribed {audio_duration:.1f}s audio in {elapsed:.1f}s")
@@ -208,38 +213,46 @@ class MedScribePipeline:
         return self.soap_gen.generate_base(transcript)
 
     # --------------------------------------------------------
-    # CLINICAL TOOLS (Base MedGemma instruction-following)
+    # CLINICAL TOOLS
+    # All tools return dict: {"text": str, "time_s": float}
     # --------------------------------------------------------
-    def suggest_icd10(self, soap_note):
-        """Suggest ICD-10-CM codes from SOAP note."""
+    def suggest_billable_diagnoses(self, soap_note):
+        """Extract billable diagnoses from SOAP note for ICD-10 coding."""
         prompt = (
-            "Do not repeat yourself. Do not include rationale, final answer, or summary sections. Stop after the numbered list."
-            "You are a medical coding assistant. Based on the following SOAP note, "
-            "suggest the most applicable ICD-10-CM codes. For each code, provide "
-            "the code and a brief description. Only suggest codes clearly supported "
-            "by the documentation. Format as a numbered list.\n\n"
+            "You are a clinical coding assistant. From the following SOAP note, "
+            "list each billable clinical diagnosis or finding that warrants an "
+            "ICD-10-CM code. For each, state the diagnosis and the specific "
+            "documentation evidence that supports it.\n"
+            "Do NOT include ICD-10 code numbers.\n"
+            "Do NOT include negative findings.\n"
+            "Do NOT include symptoms already explained by a listed diagnosis.\n"
+            "Maximum 5 diagnoses. Be concise.\n\n"
             f"SOAP NOTE:\n{soap_note}\n\n"
-            "ICD-10-CM CODES:"
+            "BILLABLE DIAGNOSES:"
         )
-        return self.soap_gen.generate_freeform(prompt, max_new_tokens=250)
+        result = self.soap_gen.generate_freeform(prompt, max_new_tokens=200)
+        result["text"] = _clean_tool_output(result["text"])
+        return result
 
     def patient_summary(self, soap_note):
         """Generate plain-language patient visit summary."""
         prompt = (
-            "Do not repeat yourself. Do not include rationale, final answer, or summary sections. Stop after the numbered list."
             "You are a patient communication assistant. Rewrite the following "
             "clinical SOAP note as a brief, plain-language summary that a patient "
             "can understand. Avoid medical jargon. Use simple, clear sentences. "
-            "Include: what was found, what it means, and what happens next.\n\n"
+            "Include: what was found, what it means, and what happens next.\n"
+            "Do not repeat yourself. Do not include rationale, final answer, or "
+            "summary sections.\n\n"
             f"SOAP NOTE:\n{soap_note}\n\n"
             "PATIENT SUMMARY:"
         )
-        return self.soap_gen.generate_freeform(prompt, max_new_tokens=300)
+        result = self.soap_gen.generate_freeform(prompt, max_new_tokens=300)
+        result["text"] = _clean_tool_output(result["text"])
+        return result
 
     def completeness_check(self, soap_note):
         """Review SOAP note for documentation gaps."""
         prompt = (
-            "be Concise"
             "You are a clinical documentation quality reviewer. Review this SOAP "
             "note for documentation gaps. Check for:\n"
             "- Subjective complaints without corresponding objective findings\n"
@@ -247,44 +260,69 @@ class MedScribePipeline:
             "- Missing follow-up or monitoring in Plan\n"
             "- Medications without dosage or frequency\n"
             "- Missing allergies or medication reconciliation\n\n"
-            "Be concise. List specific gaps found. If complete, say so.\n\n"
+            "Be concise. List specific gaps found. If complete, say so.\n"
+            "Do not repeat yourself. Do not include rationale, final answer, or "
+            "summary sections. Stop after the list.\n\n"
             f"SOAP NOTE:\n{soap_note}\n\n"
             "DOCUMENTATION REVIEW:"
         )
-        return self.soap_gen.generate_freeform(prompt, max_new_tokens=250)
+        result = self.soap_gen.generate_freeform(prompt, max_new_tokens=250)
+        result["text"] = _clean_tool_output(result["text"])
+        return result
 
     def differential_diagnosis(self, soap_note):
         """Generate differential diagnosis list from SOAP note."""
         prompt = (
-            "be Concise"
-            "Do not repeat yourself. Do not include rationale, final answer, or summary sections. Stop after the numbered list."
             "You are a clinical reasoning assistant. Based on the following SOAP note, "
             "generate a ranked differential diagnosis list. For each diagnosis:\n"
             "- State the diagnosis\n"
             "- Briefly explain supporting evidence from the note\n"
             "- Note any findings that argue against it\n\n"
-            "Rank from most likely to least likely. Include 3-5 differentials.\n\n"
+            "Rank from most likely to least likely. Include 3-5 differentials.\n"
+            "Do not repeat yourself. Do not include rationale, final answer, or "
+            "summary sections. Stop after the numbered list.\n\n"
             f"SOAP NOTE:\n{soap_note}\n\n"
             "DIFFERENTIAL DIAGNOSIS:"
         )
-        return self.soap_gen.generate_freeform(prompt, max_new_tokens=300)
+        result = self.soap_gen.generate_freeform(prompt, max_new_tokens=300)
+        result["text"] = _clean_tool_output(result["text"])
+        return result
 
     def medication_check(self, soap_note):
         """Check medications mentioned for interactions and safety concerns."""
+        # Pre-check: skip model call if no medications are documented
+        med_indicators = [
+            "mg", "daily", "bid", "tid", "qid", "prn", "mcg", "units",
+            "tablet", "capsule", "inhaler", "patch", "cream", "drops",
+            "metformin", "lisinopril", "atorvastatin", "omeprazole",
+            "amlodipine", "losartan", "aspirin", "heparin", "warfarin",
+            "enoxaparin", "insulin", "sertraline", "gabapentin",
+            "hydrochlorothiazide", "furosemide", "prednisone",
+        ]
+        note_lower = soap_note.lower()
+        if not any(ind in note_lower for ind in med_indicators):
+            return {
+                "text": "No specific medications documented in this note. "
+                        "Medication review requires named drugs with dosages.",
+                "time_s": 0.0,
+            }
+
         prompt = (
-            "be Concise"
-            "Do not repeat yourself. Do not include rationale, final answer, or summary sections. Stop after the numbered list."
             "You are a clinical pharmacist assistant. Review the medications mentioned "
             "in this SOAP note. For each medication identified:\n"
             "- Note the medication and its indication (if clear)\n"
             "- Flag potential drug-drug interactions\n"
             "- Flag contraindications based on patient conditions in the note\n"
             "- Note if dosage/frequency is missing or appears incorrect\n\n"
-            "If no medications are mentioned, state that.\n\n"
+            "If no medications are mentioned, state that.\n"
+            "Do not repeat yourself. Do not include rationale, final answer, or "
+            "summary sections. Stop after the review.\n\n"
             f"SOAP NOTE:\n{soap_note}\n\n"
             "MEDICATION REVIEW:"
         )
-        return self.soap_gen.generate_freeform(prompt, max_new_tokens=300)
+        result = self.soap_gen.generate_freeform(prompt, max_new_tokens=300)
+        result["text"] = _clean_tool_output(result["text"])
+        return result
 
     # --------------------------------------------------------
     # FULL PIPELINE

@@ -1,8 +1,9 @@
-# MedScribe -- Technical Documentation
 
-This document covers architecture, model details, training methodology,
-inference pipeline, and implementation decisions. For clinical context and
-user-facing documentation, see [README.md](https://claude.ai/chat/README.md).
+# MedScribe — Technical Documentation
+
+Architecture, model details, training methodology, inference pipeline, and
+implementation decisions. For clinical context and user-facing documentation,
+see [README.md](README.md)
 
 ---
 
@@ -13,36 +14,37 @@ in a single pipeline:
 
 ```
 [Audio Input]
-      |
-[MedASR -- 105M Conformer, CTC decode]
-      |
-[Manual CTC Collapse + Post-processing]
-      |
-[Clean Transcript -- editable by clinician]
-      |
-[MedGemma 1.5 4B + LoRA adapter -- 4-bit NF4]
-      |
-[Custom Stopping Criteria + Post-processing]
-      |
+      │
+[MedASR — 105M Conformer, CTC decode]
+      │
+[Manual CTC Collapse + 10-step Post-processing]
+      │
+[Clean Transcript — editable by clinician]
+      │
+[MedGemma 1.5 4B + LoRA adapter — 4-bit NF4]
+      │
+[SOAP Stopping Criteria + Post-processing]
+      │
 [Structured SOAP Note]
-      |
-[MedGemma 1.5 4B -- base instruction-following]
-      |
+      │
+[MedGemma 1.5 4B — base instruction-following]
+      │
+[Freeform Stopping Criteria + Post-processing]
+      │
 [Clinical Intelligence Tools (6)]
 ```
 
-| Component             | Model                  | Parameters | VRAM     | Role                                  |
-| --------------------- | ---------------------- | ---------- | -------- | ------------------------------------- |
-| Speech Recognition    | MedASR (Conformer)     | 105M       | ~400MB   | Medical dictation to text, 5.2% WER   |
-| SOAP Generation       | MedGemma 1.5 4B (LoRA) | 4B + 4.2M  | ~3GB     | Concise structured notes (~100 words) |
-| Clinical Intelligence | MedGemma 1.5 4B (base) | 4B         | (shared) | ICD-10, DDx, risk analysis, screening |
+| Component             | Model                  | Parameters | VRAM     | Role                                     |
+| --------------------- | ---------------------- | ---------- | -------- | ---------------------------------------- |
+| Speech Recognition    | MedASR (Conformer)     | 105M       | ~400MB   | Medical dictation to text, 5.2% WER      |
+| SOAP Generation       | MedGemma 1.5 4B (LoRA) | 4B + 4.2M  | ~3GB     | Concise structured notes (~100 words)    |
+| Clinical Intelligence | MedGemma 1.5 4B (base) | 4B         | (shared) | DDx, risk analysis, screening, summaries |
 
 The SOAP generation and clinical intelligence tools share the same loaded model
-instance. The LoRA adapter is active for SOAP generation and can be temporarily
-disabled (via PEFT's `disable_adapter()` context manager) for the Model
-Comparison feature. Clinical tools use the model with the adapter active -- the
-base MedGemma instruction-following capability is preserved through the LoRA
-layers.
+instance. The LoRA adapter is active for all operations. Clinical tools use the
+model's preserved instruction-following capability through the LoRA layers.
+For the Model Comparison feature, the adapter is temporarily disabled via
+PEFT's `disable_adapter()` context manager.
 
 ---
 
@@ -62,7 +64,7 @@ MedASR uses CTC (Connectionist Temporal Classification) output, which requires
 post-decoding collapse. The pipeline uses manual CTC decoding rather than the
 processor's built-in decoder for reliability:
 
-1. Forward pass produces logit matrix (time steps x vocabulary)
+1. Forward pass produces logit matrix (time steps × vocabulary)
 2. Argmax across vocabulary dimension gives predicted token IDs per time step
 3. Manual collapse: remove consecutive duplicate IDs, then remove blank tokens
 4. Map remaining token IDs to characters using the inverse vocabulary
@@ -78,40 +80,29 @@ def _manual_ctc_decode(token_ids, blank_id, id_to_token):
     return "".join(result)
 ```
 
-The inverse vocabulary is pre-built at model load time to avoid rebuilding per
-inference call.
-
 ### Transcript Post-processing
 
 Raw CTC output requires extensive cleanup. The pipeline applies a 10-step
 post-processing chain:
 
-1. **CTC stutter-killer** -- Collapse 3+ identical consecutive characters to 1.
-   Preserves valid doubles (ll, ee, ss) but eliminates CTC stutters (CCT->CT,
-   TTT->T). Regex: `(.)\1{2,}` -> `\1`
-2. **SentencePiece boundary** -- Replace `▁` (U+2581) with space. MedASR uses
-   SentencePiece tokenization that marks word boundaries with this character.
-3. **Special token removal** -- Strip `<s>`, `</s>`, `<epsilon>`, `<pad>`,
-   `<unk>` tokens that may survive decoding.
-4. **Punctuation token mapping** -- Convert formatting tokens to punctuation:
-   `{period}` -> `.`, `{comma}` -> `,`, `{colon}` -> `:`, `{semicolon}` -> `;`,
-   `{new paragraph}` -> `\n`, `{question mark}` -> `?`, `{exclamation}` -> `!`.
-   Regex handles stuttered variants like `{{period}}`.
-5. **Bracket marker removal** -- Strip `[EXAM TYPE]`, `[INDICATION]`, and
-   similar metadata brackets.
-6. **Brace cleanup** -- Remove any remaining `{` and `}` characters.
-7. **Punctuation spacing** -- Fix `word .` -> `word.` and `word.Next` ->
-   `word. Next`.
-8. **Whitespace collapse** -- Normalize multiple spaces and newlines.
-9. **Artifact trimming** -- Remove leading/trailing punctuation artifacts.
-10. **Sentence capitalization** -- Capitalize first character and
-    post-sentence characters.
+1. **CTC stutter-killer** — Collapse 3+ identical consecutive characters to 1.
+   Preserves valid doubles (ll, ee, ss) but eliminates CTC stutters.
+   Regex: `(.)\1{2,}` → `\1`
+2. **SentencePiece boundary** — Replace `▁` (U+2581) with space.
+3. **Special token removal** — Strip `<s>`, `</s>`, `<epsilon>`, `<pad>`, `<unk>`.
+4. **Punctuation token mapping** — Convert `{period}` → `.`, `{comma}` → `,`,
+   `{new paragraph}` → `\n`, etc. Handles stuttered variants like `{{period}}`.
+5. **Bracket marker removal** — Strip `[EXAM TYPE]`, `[INDICATION]`, etc.
+6. **Brace cleanup** — Remove remaining `{` and `}` characters.
+7. **Punctuation spacing** — Fix `word .` → `word.` and `word.Next` → `word. Next`.
+8. **Whitespace collapse** — Normalize multiple spaces and newlines.
+9. **Artifact trimming** — Remove leading/trailing punctuation artifacts.
+10. **Sentence capitalization** — Capitalize first character and post-sentence characters.
 
 ### Audio Preprocessing
 
 * Loaded via librosa at 16kHz mono (explicit `sr=16000, mono=True`)
-* Amplitude normalization via `librosa.util.normalize()` to handle varying
-  float32 ranges from Gradio's audio component
+* Amplitude normalization via `librosa.util.normalize()`
 * No additional noise reduction or VAD applied
 
 ---
@@ -122,7 +113,7 @@ post-processing chain:
 
 Base model: `google/medgemma-4b-it` (instruction-tuned variant)
 
-Quantization configuration:
+Quantization:
 
 ```python
 BitsAndBytesConfig(
@@ -133,20 +124,8 @@ BitsAndBytesConfig(
 )
 ```
 
-The base model is loaded with 4-bit NF4 quantization and double quantization
-enabled, reducing VRAM from ~8GB (FP16) to ~3GB. Compute dtype is bfloat16
-for the dequantized operations.
-
-The LoRA adapter is loaded on top via PEFT:
-
-```python
-self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
-self.model.eval()
-self.model.config.use_cache = True
-```
-
-A warmup generation (10 tokens) runs at load time to compile CUDA kernels
-and populate caches.
+Reduces VRAM from ~8GB (FP16) to ~3GB. The LoRA adapter is loaded via PEFT,
+and a warmup generation (10 tokens) runs at load time to compile CUDA kernels.
 
 ### LoRA Adapter
 
@@ -158,8 +137,6 @@ and populate caches.
 | Target modules   | All attention layers |
 | Trainable params | ~4.2M (0.1% of base) |
 | Adapter size     | ~17MB on disk        |
-
-Adapter path: `./models/checkpoints/medgemma_v2_soap/final_model`
 
 ### Prompt Template
 
@@ -192,79 +169,135 @@ SOAP NOTE:
 | top_p          | None  | Disabled (greedy)                            |
 | use_cache      | True  | KV cache for autoregressive efficiency       |
 
-### Custom Stopping Criteria
+### SOAP Stopping Criteria
 
-Two custom stopping criteria run during generation:
+Two custom stopping criteria run during SOAP generation:
 
 **SOAP Completion Criteria** (`_SOAPCompletionCriteria`):
-Monitors generated text and triggers stop when ALL conditions are met:
+Triggers stop when ALL conditions are met:
 
-1. Generated token count exceeds `min_tokens` (150)
-2. All four section headers (SUBJECTIVE, OBJECTIVE, ASSESSMENT, PLAN) are present
-3. PLAN section contains at least 150 characters
-4. PLAN ends with a sentence-terminal character (`.`, `).`, or `?`)
-5. PLAN contains at least 2 clinical action verbs from a curated list:
-   `order, start, continue, follow, monitor, check, obtain, repeat, schedule, refer, prescribe, administer, recommend, counsel, return, admit, discharge, daily, bid, tid, prn, consider, evaluate`
-
-This ensures the PLAN section is clinically complete and doesn't truncate
-mid-sentence or mid-instruction.
+1. Token count exceeds `min_tokens` (150)
+2. All four section headers present (SUBJECTIVE, OBJECTIVE, ASSESSMENT, PLAN)
+3. PLAN section ≥ 150 characters
+4. PLAN ends with sentence-terminal (`.`, `).`, `?`)
+5. PLAN contains ≥ 2 clinical action verbs from curated list:
+   `order, start, continue, follow, monitor, check, obtain, repeat, schedule, refer, prescribe, recommend, counsel, return, admit, discharge, consider, evaluate`
 
 **Repetition Detector** (`_StopOnRepetition`):
-Triggers stop if:
-
-1. A second occurrence of "SUBJECTIVE" appears (model is repeating the note)
-2. Any prompt leakage markers appear in the output: "Generate a SOAP note",
-   "MEDICAL TEXT:", "You are a clinical documentation", "Convert the following",
-   or a `---` separator
+Triggers if a second "SUBJECTIVE" appears or prompt leakage markers are detected.
 
 ### SOAP Post-processing
 
-The `_clean_soap()` function applies sequential cleanup:
+`_clean_soap()` applies: prompt echo stripping, preamble trimming, duplicate
+SOAP note removal, prompt leakage removal, and trailing incomplete fragment
+trimming (truncates at last complete sentence).
 
-1. Strip content before "SOAP NOTE:" if present (prompt echo)
-2. Locate first SUBJECTIVE header and trim any preamble
-3. Detect and remove duplicate SOAP notes (second SUBJECTIVE occurrence)
-4. Remove prompt leakage markers
-5. Trim trailing incomplete fragments (sentences ending with dangling
-   conjunctions like "and", "or", "with", "for", etc.) by truncating to the
-   last complete sentence
+---
 
-### Base Model Comparison
+## Freeform Generation (Clinical Tools)
 
-The `generate_base()` method temporarily disables the LoRA adapter using PEFT's
-context manager:
+All clinical tools use `generate_freeform()`, which has its own stopping
+criteria and post-processing chain separate from SOAP generation.
 
-```python
-with self.model.disable_adapter():
-    outputs = self.model.generate(...)
-```
+### Freeform Stopping Criteria
 
-This produces output from the base MedGemma model without any fine-tuning,
-using the same prompt, same stopping criteria, and same post-processing. The
-adapter is automatically re-enabled when the context manager exits, even if an
-exception occurs (fixed in PEFT >= 0.5.0).
+**`_FreeformStopCriteria`** — Monitors generated text and stops on:
+
+1. **SOAP leakage** — both "SUBJECTIVE:" and "OBJECTIVE:" detected (model
+   reverting to SOAP generation mode)
+2. **Prompt/header leakage** — any prompt marker appears after the first 20
+   characters of output (indicates the model is re-emitting its prompt):
+   `SOAP NOTE:`, `MEDICAL TEXT:`, `PATIENT PROFILE:`, `BILLABLE DIAGNOSES:`,
+   `DOCUMENTATION REVIEW:`, `DIFFERENTIAL DIAGNOSIS:`, `MEDICATION REVIEW:`,
+   `GAPS:`, and others
+3. **Analysis section repetition** — any of the five analysis headers
+   (RISK ASSESSMENT, DIFFERENTIAL CONSIDERATIONS, RECOMMENDED SCREENINGS,
+   RED FLAGS, CLINICAL QUESTIONS) appears a second time
+
+### Freeform Post-processing
+
+After generation, three sequential cleanup stages run:
+
+ **Stage 1 — Marker truncation** : If any known section header appears after the
+first 20 characters, text is truncated at that point.
+
+ **Stage 2 — Analysis header deduplication** : For each of the five analysis
+headers, if a second occurrence exists, text is truncated at that point.
+
+ **Stage 3 — Line deduplication** : Lines are compared after normalization
+(lowercase, stripped). If a line longer than 20 characters has been seen
+before, all subsequent content is discarded. This catches numbered-list
+degeneration where the model repeats items verbatim.
+
+ **Stage 4 — Tail cleanup** : Trailing artifacts like `**RANKED`, `**NOTE`,
+`**SUMMARY`, orphaned `**` markers are stripped.
+
+### Tool Output Post-processing
+
+`_clean_tool_output()` runs on all tool outputs before display:
+
+* Strips "Final Answer:" and "The final answer is" blocks
+* Strips second+ "Rationale:" sections
+* Removes LaTeX `$\boxed{...}$` artifacts from base model instruction-tuning
+* **Strips lines containing "not documented in source" or "not specified in
+  source"** — removes unsupported differential diagnoses and padding entries
+* Strips trailing incomplete headers
 
 ---
 
 ## Clinical Intelligence Tools
 
-All tools share the same `generate_freeform()` method, which generates text
-without the SOAP-specific stopping criteria. Each tool provides a specialized
-prompt template.
+| Tool                    | max_new_tokens | Strategy                                                                                  |
+| ----------------------- | -------------- | ----------------------------------------------------------------------------------------- |
+| Billable Diagnoses      | 200            | Diagnosis extraction in plain English; no ICD-10 code numbers (avoids hallucinated codes) |
+| Patient Summary         | 300            | Plain language, no jargon                                                                 |
+| Completeness Check      | 250            | Gap detection checklist                                                                   |
+| Differential Diagnosis  | 300            | Ranked list with evidence; unsupported entries auto-stripped                              |
+| Medication Check        | 300            | Pre-check: skips model call if no medications detected in note                            |
+| Patient Intake Analysis | 800            | 5-section structured analysis with defense-in-depth truncation                            |
 
-| Tool                    | max_new_tokens | Prompt strategy                      |
-| ----------------------- | -------------- | ------------------------------------ |
-| ICD-10 Coding           | 250            | Numbered list, evidence-backed codes |
-| Patient Summary         | 300            | Plain language, no jargon            |
-| Completeness Check      | 250            | Gap detection checklist              |
-| Differential Diagnosis  | 300            | Ranked list with evidence            |
-| Medication Check        | 300            | Interaction/contraindication review  |
-| Patient Intake Analysis | 500            | 5-section structured analysis        |
+### Billable Diagnoses (formerly ICD-10 Codes)
 
-The Patient Intake Analysis tool constructs a patient profile string from the
-structured form inputs and uses a specialized prompt requesting exactly five
-sections (Risk Assessment, Differential Considerations, Recommended Screenings,
-Red Flags, Clinical Questions).
+Early versions attempted to generate ICD-10-CM code numbers directly. Testing
+revealed that MedGemma cannot reliably recall correct ICD-10 codes — it
+generates plausible-looking alphanumeric strings that map to wrong descriptions
+(e.g., outputting I50.9 labeled as "pulmonary embolism" when I50.9 is actually
+"heart failure, unspecified"). The correct PE code is I26.99.
+
+The tool was redesigned to extract billable diagnoses in plain English with
+documentation evidence, which is what coders actually need as a starting point.
+This approach produces zero hallucinated codes and faster inference (200 tokens
+vs 300).
+
+### Medication Check Pre-screening
+
+Before calling the model, the medication check scans the SOAP note for
+medication indicators (drug names, dosage units like "mg", "daily", "bid",
+frequency terms, and common medication names). If none are found, it returns
+immediately with "No specific medications documented in this note" — saving
+~18 seconds of inference on notes without medication data.
+
+### Patient Intake Analysis
+
+Accepts 15 structured fields and generates five sections: Risk Assessment,
+Differential Considerations, Recommended Screenings, Red Flags, and Clinical
+Questions. The prompt enforces strict constraints:
+
+* Maximum 3 bullet points per section
+* Do NOT repeat any section
+* Stop after CLINICAL QUESTIONS
+
+ **Defense-in-depth truncation** : After `generate_freeform()` returns, the
+`run_patient_analysis` handler applies a second round of section-header
+deduplication before passing text to `_format_analysis_html()`. This catches
+any repetition that survived the freeform post-processing.
+
+ **Card filtering** : `_format_analysis_html()` skips cards with fewer than 20
+characters of content, preventing broken/empty cards from rendering in the UI.
+
+ **Sparse output handling** : `_run_tool()` appends a contextual note when tool
+output is under 80 characters, informing the user that the source note may
+lack sufficient clinical detail for comprehensive analysis.
 
 ---
 
@@ -272,41 +305,37 @@ Red Flags, Clinical Questions).
 
 ### Data Generation
 
-Training data was generated using the OpenAI API (GPT-4o Mini) with
-anti-hallucination constraints:
+| Parameter | Value                                             |
+| --------- | ------------------------------------------------- |
+| Source    | GPT-4o Mini API                                   |
+| Samples   | 712 curated transcript-SOAP pairs                 |
+| Cost      | $1.28 total                                       |
+| Format    | Medical encounter transcript → concise SOAP note |
 
-* 712 curated transcript-SOAP pairs
-* Total cost: $1.28 via GPT-4o Mini API
-* Each sample consists of a medical encounter transcript and the target
-  concise SOAP note
+Anti-hallucination constraints enforced during data generation:
 
-Anti-hallucination constraints enforced during generation:
+* "Not documented in source" for any finding not in the input transcript
+* Zero WNL (Within Normal Limits) shortcuts
+* Concise clinical shorthand, not verbose prose
+* PLAN must contain specific, actionable items
 
-* "Not documented in source" for any clinical finding not present in the
-  input transcript
-* Zero WNL (Within Normal Limits) shortcuts -- every finding must be
-  explicitly stated
-* Concise clinical shorthand style rather than verbose prose
-* PLAN section must contain specific, actionable items
+The training data teaches MedGemma a specific output style and safety behavior,
+not clinical knowledge — the base model's medical knowledge is preserved.
 
 ### Training Configuration
 
-| Parameter                    | Value                |
-| ---------------------------- | -------------------- |
-| Base model                   | MedGemma 1.5 4B      |
-| Method                       | LoRA                 |
-| Rank                         | 16                   |
-| Alpha                        | 32                   |
-| Dropout                      | 0.05                 |
-| Target modules               | All attention layers |
-| Batch size (per device)      | 8                    |
-| Gradient accumulation        | 4 (effective: 32)    |
-| Learning rate                | 2e-4                 |
-| Epochs                       | 3                    |
-| Precision                    | BFloat16             |
-| Quantization during training | 4-bit NF4            |
+| Parameter      | Value                                                |
+| -------------- | ---------------------------------------------------- |
+| Base model     | MedGemma 1.5 4B                                      |
+| Method         | LoRA (rank 16, alpha 32, dropout 0.05)               |
+| Target modules | All attention layers                                 |
+| Batch size     | 8 per device, 4 gradient accumulation (effective 32) |
+| Learning rate  | 2e-4                                                 |
+| Epochs         | 3                                                    |
+| Precision      | BFloat16                                             |
+| Quantization   | 4-bit NF4 during training                            |
 
-### Training Results
+### Results
 
 | Metric          | Value              |
 | --------------- | ------------------ |
@@ -314,34 +343,20 @@ Anti-hallucination constraints enforced during generation:
 | Validation loss | 0.782              |
 | Overfitting     | None (val < train) |
 
-The validation loss being lower than training loss indicates good
-generalization without overfitting, likely due to LoRA's implicit
-regularization and the relatively small adapter parameter count (4.2M vs 4B
-base parameters).
+Validation loss below training loss indicates good generalization, likely
+due to LoRA's implicit regularization and the small adapter parameter count
+(4.2M vs 4B base).
 
-### Evaluation Results
+### Fine-tuning Impact
 
-Evaluated on held-out test set:
-
-| Metric                | Value          |
-| --------------------- | -------------- |
-| Quality score         | 90/100         |
-| Section completeness  | 100% (S/O/A/P) |
-| Hallucinated findings | 0%             |
-| WNL shortcuts         | 0%             |
-| Avg word count        | 104 words      |
-| PLAN items per note   | 2-4            |
-
-### Fine-tuning Impact (Base vs LoRA)
-
-| Metric                | Base MedGemma  | Fine-tuned (LoRA) | Change          |
-| --------------------- | -------------- | ----------------- | --------------- |
-| Avg word count        | ~200+ words    | 104 words         | 46% shorter     |
-| Section completeness  | 85-95%         | 100%              | Always complete |
-| Hallucinated findings | 5-10%          | 0%                | Eliminated      |
-| WNL shortcuts         | Present        | 0%                | Eliminated      |
-| Clinical style        | Textbook prose | Shorthand         | Clinician-ready |
-| PLAN items            | 4-8            | 2-4               | Focused         |
+| Metric                | Base MedGemma        | Fine-tuned (LoRA) | Change          |
+| --------------------- | -------------------- | ----------------- | --------------- |
+| Avg word count        | ~200+ words          | 104 words         | 46% shorter     |
+| Section completeness  | 85-95%               | 100%              | Always complete |
+| Hallucinated findings | 5-10%                | 0%                | Eliminated      |
+| WNL shortcuts         | Present              | 0%                | Eliminated      |
+| Clinical style        | Textbook prose       | Shorthand         | Clinician-ready |
+| PLAN items            | 4-8 (over-specified) | 2-4 (focused)     | Actionable      |
 
 ---
 
@@ -349,110 +364,71 @@ Evaluated on held-out test set:
 
 ### Framework
 
-Gradio 5+ with custom CSS theme. Soft theme with teal primary and slate
-neutral hues.
+Gradio 5+ with custom CSS. Soft theme with teal primary and slate neutral hues.
 
 ### Tabs
 
-1. **Voice to SOAP** -- Audio input (microphone/upload) + MedASR + SOAP generation
-2. **Text to SOAP** -- Transcript input + SOAP generation + example transcripts
-3. **Clinical Tools** -- 5 tool buttons operating on SOAP notes
-4. **Patient Analysis** -- Structured form with 15 fields + analysis output
-5. **Model Comparison** -- Side-by-side base vs fine-tuned output
-6. **About MedScribe** -- Clinical context and feature descriptions
-7. **Technical Details** -- Architecture, training, and metrics
+1. **Voice to SOAP** — Audio input + MedASR + SOAP generation
+2. **Text to SOAP** — Transcript input + SOAP generation + examples
+3. **Clinical Tools** — 5 tool buttons operating on SOAP notes
+4. **Patient Analysis** — Structured intake form + 5-section analysis
+5. **Model Comparison** — Side-by-side base vs fine-tuned output
+6. **About MedScribe** — Clinical context, feature descriptions, limitations
+7. **Technical Details** — Architecture, training, metrics
 
 ### Dynamic Status Pills
 
 All long-running handlers are Python generators that `yield` intermediate
-status updates to the UI. This provides real-time feedback during the 20-30
-second inference window:
-
-* Upload audio -> "Transcribing audio (MedASR)..."
-* MedASR completes -> "Generating SOAP note (MedGemma)... ASR took Xs"
-* SOAP completes -> "Done in Xs -- ASR Xs + SOAP Xs"
-
-Status pills have three visual states:
-
-* Default (gray): idle/informational
-* Processing (blue, pulsing): operation in progress
-* Ready (green): operation complete
-* Error (red): operation failed
+status updates. Status pills have four visual states: idle (gray),
+processing (blue, pulsing animation), ready (green), and error (red).
 
 ### Anti-Stutter CSS
 
-Gradio's default loading animations cause visible UI jerks (layout shifts)
-when components update. MedScribe suppresses these through CSS:
+Gradio's loading animations cause visible layout shifts. MedScribe suppresses
+these through:
 
-```css
-.pending, .generating, .translucent {
-    opacity: 1 !important;
-    animation: none !important;
-    border: none !important;
-}
-.eta-bar, .progress-bar, .loader, .svelte-spinner {
-    display: none !important;
-    height: 0 !important;
-}
-```
-
-Additional stability measures:
-
-* `html { overflow-y: scroll !important; }` -- forces permanent scrollbar to
-  prevent lateral width snapping
-* `[data-testid="audio"] { min-height: 160px !important; }` -- prevents
-  vertical jump on audio upload
-* `container=False` on Audio component -- removes Gradio wrapper container
-  that caused reflow on file upload
-* `.soap-output { min-height: 140px !important; }` -- prevents HTML output
-  components from collapsing during intermediate yield states
-* `show_progress="hidden"` on all click handlers -- disables Gradio's
-  built-in progress indicators
+* `.pending, .generating, .translucent` — opacity forced to 1, animations disabled
+* `.eta-bar, .progress-bar, .loader` — hidden with `display: none`
+* `html { overflow-y: scroll }` — permanent scrollbar prevents lateral snapping
+* `min-height` on audio and output components prevents vertical collapse
+* `container=False` on Audio component removes reflow-causing wrapper
+* `show_progress="hidden"` on all click handlers
 
 ### Light Mode Enforcement
 
-MedScribe forces light mode regardless of OS dark mode preference through
-three independent mechanisms:
+Three independent mechanisms force light mode regardless of OS preference:
 
-1. **Browser level** : `color-scheme: light only !important` on `:root, html, body`
-2. **DOM level** : JavaScript MutationObserver removes `.dark` class from
-   `document.documentElement` whenever Gradio adds it during hydration
-3. **CSS level** : `.dark, .dark *` selector overrides all Gradio CSS variables
-   to light-mode values as a fallback
+1. **Browser** : `color-scheme: light only !important` on root elements
+2. **DOM** : MutationObserver removes `.dark` class during Gradio hydration
+3. **CSS** : `.dark, .dark *` selector overrides all Gradio dark-mode variables
 
 ---
 
 ## Deployment
 
-| Spec           | Value                                        |
-| -------------- | -------------------------------------------- |
-| GPU            | RTX 5070 Ti (16GB VRAM)                      |
-| Quantization   | 4-bit NF4 with double quantization           |
-| MedASR VRAM    | ~400MB                                       |
-| MedGemma VRAM  | ~3GB (4-bit)                                 |
-| Total VRAM     | ~3.4GB (both models loaded)                  |
-| Framework      | Gradio 5+                                    |
-| Inference mode | Greedy decoding, KV cache, inference_mode    |
-| Privacy        | Fully offline -- no network calls at runtime |
-| OS             | Windows 11 (developed), Linux compatible     |
-| Python         | 3.10+                                        |
-| CUDA           | 12.8 (PyTorch nightly for Blackwell SM 12.0) |
+| Spec         | Value                                           |
+| ------------ | ----------------------------------------------- |
+| GPU          | RTX 5070 Ti (16GB VRAM)                         |
+| Quantization | 4-bit NF4 with double quantization              |
+| Total VRAM   | ~3.4GB (MedASR ~400MB + MedGemma ~3GB)          |
+| Framework    | Gradio 5+                                       |
+| Inference    | Greedy decoding, KV cache, torch.inference_mode |
+| Privacy      | Fully offline — no network calls at runtime    |
+| OS           | Windows 11 (developed), Linux compatible        |
+| Python       | 3.10+                                           |
+| CUDA         | 12.8 (PyTorch nightly for Blackwell SM 12.0)    |
 
-### Known Platform Issues
+### Known Platform Constraints
 
 * **Windows + Flash Attention** : Installation fails due to long path
-  limitations on Windows. Not used; standard attention is sufficient for
+  limitations. Not required — standard attention is sufficient for
   single-request inference.
-* **Windows + multiprocessing** : Some PyTorch multiprocessing features are
-  incompatible with Windows. Not applicable for single-GPU inference.
-* **bitsandbytes on Windows** : Requires `bitsandbytes-windows` package or
-  recent bitsandbytes versions with native Windows support.
+* **bitsandbytes on Windows** : Requires recent versions with native Windows
+  support or the `bitsandbytes-windows` package.
 
 ---
 
 ## Dependencies
-
-Core runtime dependencies (see `requirements.txt` for pinned versions):
 
 | Package       | Purpose                                  |
 | ------------- | ---------------------------------------- |
@@ -471,11 +447,17 @@ Core runtime dependencies (see `requirements.txt` for pinned versions):
 
 ## File Reference
 
-| File                       | Lines | Purpose                                         |
-| -------------------------- | ----- | ----------------------------------------------- |
-| `app.py`                 | ~1100 | Gradio UI, handlers, CSS, HTML formatting       |
-| `src/inference.py`       | ~360  | SOAPGenerator class, stopping criteria, prompts |
-| `src/pipeline.py`        | ~310  | MedScribePipeline, MedASR, CTC decode, tools    |
-| `train_v2.py`            | ~400  | LoRA fine-tuning script                         |
-| `evaluate_v2.py`         | ~300  | Quality evaluation metrics                      |
-| `generate_soap_gpt4o.py` | ~400  | Training data generation via OpenAI API         |
+| File                       | Lines | Purpose                                                     |
+| -------------------------- | ----- | ----------------------------------------------------------- |
+| `app.py`                 | ~1200 | Gradio UI, handlers, CSS, HTML formatting                   |
+| `src/inference.py`       | ~400  | SOAPGenerator, stopping criteria (SOAP + freeform), prompts |
+| `src/pipeline.py`        | ~400  | MedScribePipeline, MedASR, CTC decode, clinical tools       |
+| `train_v2.py`            | ~400  | LoRA fine-tuning script                                     |
+| `evaluate_v2.py`         | ~300  | Quality evaluation metrics                                  |
+| `generate_soap_gpt4o.py` | ~400  | Training data generation via OpenAI API                     |
+
+## Documentation and LInks
+
+#### Adaptors/Safetensors: [Huggingface](https://huggingface.co/Tushar9802/medscribe-soap-lora)
+
+#### Dataset: [Kaggle](https://www.kaggle.com/datasets/tusharjaju/medscribe-soap-training-data-712-curated-samples)

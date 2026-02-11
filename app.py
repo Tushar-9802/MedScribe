@@ -7,7 +7,7 @@ powered by Google HAI-DEF models (MedASR + MedGemma).
 Tabs:
 1. Voice to SOAP      — MedASR transcription + MedGemma SOAP generation
 2. Text to SOAP       — Paste transcript, generate SOAP
-3. Clinical Tools     — ICD-10, patient summary, completeness, DDx, med check
+3. Clinical Tools     — billable_diagnoses, patient summary, completeness, DDx, med check
 4. Patient Analysis   — Structured intake → risk/screening/red flags
 5. Model Comparison   — Base vs Fine-tuned MedGemma side-by-side
 6. About              — Architecture, metrics, methodology
@@ -15,6 +15,7 @@ Tabs:
 Launch: python app.py
 """
 import os
+import re
 import time
 import html as html_mod
 import gradio as gr
@@ -343,13 +344,23 @@ def _status(level, msg):
 
 
 def _tool_html(text):
-    """Wrap clinical tool output in styled card."""
+    """Wrap clinical tool output in styled card with post-processing."""
+    if not text:
+        return ""
+    # Strip model junk tails before escaping
+    for marker in ["Final Answer:", "The final answer is", "Rationale:"]:
+        idx = text.find(marker)
+        if idx != -1:
+            text = text[:idx].strip()
+    text = re.sub(r'\$\\boxed\{[^}]*\}\$', '', text)
+    text = text.strip()
     if not text:
         return ""
     safe = html_mod.escape(text)
     safe = safe.replace('\n', '<br>')
-    import re
+    # Convert **bold** markers to HTML, then strip orphaned **
     safe = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', safe)
+    safe = safe.replace('**', '')
     return f'<div class="tool-output">{safe}</div>'
 
 
@@ -529,17 +540,23 @@ def _run_tool(tool_fn, tool_name, soap_note_input):
         yield _status("processing", f"Running {tool_name}..."), ""
 
         result = tool_fn(note)
+        output_text = result["text"]
+
+        # If tool output is very thin after cleanup, add context
+        if output_text and len(output_text.strip()) < 80:
+            output_text += ("\n\nNote: Limited output — the source note may lack "
+                            "sufficient clinical detail for comprehensive analysis.")
 
         yield (
             _status("ready", f'{tool_name} — {result["time_s"]}s'),
-            _tool_html(result["text"]),
+            _tool_html(output_text),
         )
     except Exception as e:
         yield _status("error", str(e)), ""
 
 
-def run_icd10(soap_input):
-    yield from _run_tool(get_pipeline().suggest_icd10, "ICD-10 coding", soap_input)
+def run_billable_diagnoses(soap_input):
+    yield from _run_tool(get_pipeline().suggest_billable_diagnoses, "Billable Diagnoses", soap_input)
 
 
 def run_patient_summary(soap_input):
@@ -576,15 +593,18 @@ def _format_analysis_html(raw_text):
 
     import re
     cards = []
-    remaining = raw_text
 
     for key, (css_class, display_name) in sections.items():
         pattern = rf'{key}:?\s*\n?(.*?)(?=(?:{"|".join(sections.keys())}):?\s*\n|$)'
-        match = re.search(pattern, remaining, re.DOTALL | re.IGNORECASE)
+        match = re.search(pattern, raw_text, re.DOTALL | re.IGNORECASE)
         if match:
             content = match.group(1).strip()
-            if content:
+            # Skip empty or near-empty cards (broken generation artifacts)
+            if content and len(content) > 20:
                 safe = html_mod.escape(content).replace('\n', '<br>')
+                safe = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', safe)
+                safe = safe.replace('**', '')  # orphaned bold markers
+                safe = re.sub(r'(`\s*){3,}', '', safe)
                 cards.append(
                     f'<div class="analysis-card {css_class}">'
                     f'<div class="analysis-card-header">{display_name}</div>'
@@ -597,6 +617,7 @@ def _format_analysis_html(raw_text):
 
     safe = html_mod.escape(raw_text).replace('\n', '<br>')
     safe = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', safe)
+    safe = safe.replace('**', '')
     return f'<div class="analysis-card card-risk">{safe}</div>'
 
 
@@ -654,28 +675,44 @@ def run_patient_analysis(age, sex, ethnicity, chief_complaint, duration,
         "following profile. Analyze this comprehensively and provide insights a busy "
         "clinician might miss.\n\n"
         f"PATIENT PROFILE:\n{patient_profile}\n\n"
-        "Be concise. Use 2-3 bullet points per section."
+        "IMPORTANT: Flag EVERY abnormal lab value, including incidental findings "
+        "unrelated to the chief complaint. For each risk or differential, include "
+        "a specific next diagnostic step (imaging, labs, referral).\n\n"
+        "STRICT RULES:\n"
+        "- Maximum 3 bullet points per section.\n"
+        "- Do NOT repeat any section. Write each section exactly once.\n"
+        "- Stop after CLINICAL QUESTIONS. Do not continue.\n\n"
         "Provide your analysis in exactly these 5 sections:\n\n"
         "RISK ASSESSMENT:\n"
-        "Based on demographics, history, and family history, list conditions this "
-        "patient is predisposed to. Consider hereditary patterns and age/sex-specific risks.\n\n"
+        "Top 3 conditions this patient is predisposed to with specific next "
+        "diagnostic steps. Consider hereditary patterns and ethnic-specific risks.\n\n"
         "DIFFERENTIAL CONSIDERATIONS:\n"
-        "For the chief complaint, list 3-5 differential diagnoses ranked by likelihood. "
-        "Include at least one uncommon condition that could be missed ('zebra'). "
-        "For each, note supporting and refuting evidence from the profile.\n\n"
+        "3 differential diagnoses ranked by likelihood for the chief complaint. "
+        "Include one uncommon 'zebra'. For each: evidence and recommended workup.\n\n"
         "RECOMMENDED SCREENINGS:\n"
-        "Based on age, sex, history, and risk factors, list preventive screenings "
-        "this patient should have. Note if any are overdue or especially urgent.\n\n"
+        "Top 3 urgent or preventive screenings this patient needs. Include any "
+        "urgent workups for abnormal lab values.\n\n"
         "RED FLAGS:\n"
-        "Identify any combinations of symptoms, history, or risk factors that "
-        "warrant urgent attention. Flag drug-disease interactions if medications listed.\n\n"
+        "Top 3 combinations of symptoms, history, or risk factors warranting "
+        "urgent attention. Flag abnormal labs and drug-disease interactions.\n\n"
         "CLINICAL QUESTIONS:\n"
-        "List 3-5 specific questions the clinician should ask this patient to "
-        "narrow the differential or uncover hidden risks."
+        "3 specific questions the clinician should ask to narrow the differential."
     )
 
     try:
-        result = pipe.soap_gen.generate_freeform(prompt, max_new_tokens=500)
+        result = pipe.soap_gen.generate_freeform(prompt, max_new_tokens=800)
+
+        # Defense-in-depth: strip repeated analysis sections
+        text = result["text"]
+        for header in ["RISK ASSESSMENT", "DIFFERENTIAL CONSIDERATIONS",
+                        "RECOMMENDED SCREENINGS", "RED FLAGS", "CLINICAL QUESTIONS"]:
+            upper_t = text.upper()
+            first = upper_t.find(header)
+            if first != -1:
+                second = upper_t.find(header, first + len(header) + 10)
+                if second != -1:
+                    text = text[:second].strip()
+        result["text"] = text
 
         # Stage 2: Done
         yield (
@@ -879,7 +916,7 @@ def build_app():
                 )
 
                 with gr.Row():
-                    icd_btn = gr.Button("ICD-10 Codes", variant="secondary", scale=1)
+                    billable_diagnoses_btn = gr.Button("Billable Diagnoses", variant="secondary", scale=1)
                     summary_btn = gr.Button("Patient Summary", variant="secondary", scale=1)
                     complete_btn = gr.Button("Completeness Check", variant="secondary", scale=1)
 
@@ -891,7 +928,7 @@ def build_app():
                 gr.HTML('<div class="section-label">Result</div>')
                 tools_output = gr.HTML()
 
-                icd_btn.click(fn=run_icd10, inputs=[tools_soap_input],
+                billable_diagnoses_btn.click(fn=run_billable_diagnoses, inputs=[tools_soap_input],
                               outputs=[tools_status, tools_output], show_progress="hidden")
                 summary_btn.click(fn=run_patient_summary, inputs=[tools_soap_input],
                                   outputs=[tools_status, tools_output], show_progress="hidden")
@@ -1063,9 +1100,6 @@ def build_app():
                 gr.Examples(examples=EXAMPLE_TRANSCRIPTS, inputs=[compare_input], label="")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # TAB 6: About
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # TAB 6: About MedScribe
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             with gr.TabItem("About MedScribe"):
@@ -1114,32 +1148,22 @@ structured SOAP note. Useful for converting existing unstructured documentation
 into standardized format, or for demonstrating the model without audio input.
 
 **Clinical Tools** — Five post-generation tools powered by base MedGemma's
-instruction-following capability. These transform a SOAP note from passive
-documentation into an active clinical decision support artifact:
+instruction-following capability:
 
-- **ICD-10 Coding**: Suggests billing codes supported by the documentation,
-  reducing coding time and improving reimbursement accuracy.
-- **Patient Summary**: Generates a plain-language visit summary suitable for
-  patient portals or discharge instructions.
-- **Completeness Check**: Reviews the note for documentation gaps — missing
-  vitals, diagnoses without supporting evidence, medications without dosages.
-- **Differential Diagnosis**: Produces a ranked differential with supporting
-  and refuting evidence from the note, catching diagnoses the clinician may
-  not have considered.
-- **Medication Check**: Flags drug-drug interactions, contraindications, and
-  dosage concerns based on the documented medications and conditions.
+- **Billable Diagnoses**: Extracts diagnoses supported by documentation for Dillable Diagnoses.
+- **Patient Summary**: Plain-language visit summary for patient portals or discharge.
+- **Completeness Check**: Identifies documentation gaps and missing elements.
+- **Differential Diagnosis**: Ranked DDx with supporting and refuting evidence.
+- **Medication Check**: Flags interactions, contraindications, and dosage issues.
 
-**Patient Intake Analysis** — A structured intake form that accepts demographics,
-medical history, family history, medications, lifestyle factors, and lab results.
-MedGemma analyzes the complete profile to produce risk assessments, differential
-considerations, recommended screenings, red flags, and clinical questions the
-provider should ask. Designed to surface insights a busy clinician might miss
-during a time-pressured visit.
+**Patient Intake Analysis** — Structured intake form accepting demographics,
+history, medications, lifestyle, and labs. MedGemma produces risk assessments,
+differential considerations, recommended screenings, red flags, and clinical
+questions the provider should ask.
 
-**Model Comparison** — Side-by-side comparison of base MedGemma output versus
-the LoRA fine-tuned model on the same transcript. Demonstrates the concrete
-value of fine-tuning: shorter notes, clinical shorthand, focused plans, and
-zero hallucination.
+**Model Comparison** — Side-by-side comparison of base MedGemma vs LoRA
+fine-tuned model on the same transcript, demonstrating the concrete value of
+fine-tuning: shorter notes, clinical shorthand, focused plans, zero hallucination.
 
 ---
 
@@ -1149,6 +1173,7 @@ zero hallucination.
 - Research prototype — not validated for clinical use
 - Training data derived from synthetic encounters
 - Inference speed is hardware-dependent (~25s on RTX 5070 Ti)
+- Clinical tools use base model instruction-following, not fine-tuned
 
 ---
 
@@ -1166,14 +1191,14 @@ MedGemma Impact Challenge 2026 | Main Track + Novel Task Prize
 |-----------|-------|------|
 | Speech Recognition | MedASR (105M, Conformer) | Medical dictation to text, 5.2% WER |
 | SOAP Generation | MedGemma 1.5 4B (LoRA) | Concise structured notes (~100 words) |
-| Clinical Intelligence | MedGemma 1.5 4B (base) | ICD-10, DDx, risk analysis, screening |
+| Clinical Intelligence | MedGemma 1.5 4B (base) | DDx, risk analysis, screening, summaries |
 
 The pipeline uses three distinct capabilities of Google's HAI-DEF ecosystem.
 MedASR handles domain-specific speech recognition with medical vocabulary
 via CTC decoding and post-processing. The fine-tuned MedGemma model (LoRA
 adapter on 712 curated samples) generates concise SOAP notes. The same base
 MedGemma model, with its preserved instruction-following capability, powers
-all six clinical intelligence tools without additional fine-tuning.
+all clinical intelligence tools without additional fine-tuning.
 
 ---
 
@@ -1219,18 +1244,18 @@ if the model begins re-emitting the prompt or repeating SUBJECTIVE.
 
 ### Clinical Intelligence Tools
 
-All six tools use the same loaded MedGemma model with LoRA adapter active.
+All tools use the same loaded MedGemma model with LoRA adapter active.
 The base model's instruction-following capability is preserved through the
 adapter, requiring no separate model load.
 
 | Tool | Max Tokens | Typical Time |
 |------|-----------|-------------|
-| ICD-10 Coding | 250 | ~15s |
+| Billable Diagnoses | 200 | ~10s |
 | Patient Summary | 300 | ~18s |
 | Completeness Check | 250 | ~15s |
 | Differential Diagnosis | 300 | ~18s |
 | Medication Check | 300 | ~18s |
-| Patient Intake Analysis | 500 | ~30s |
+| Patient Intake Analysis | 800 | ~35s |
 
 ---
 
